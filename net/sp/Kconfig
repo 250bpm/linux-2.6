@@ -1,0 +1,8 @@
+#
+# SP Domain Sockets
+#
+
+config SP
+	tristate "SP domain sockets"
+	---help---
+	  Magic.

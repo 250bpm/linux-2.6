@@ -19,6 +19,7 @@ obj-$(CONFIG_NETFILTER)		+= netfilter/
 obj-$(CONFIG_INET)		+= ipv4/
 obj-$(CONFIG_XFRM)		+= xfrm/
 obj-$(CONFIG_UNIX)		+= unix/
+obj-$(CONFIG_SP)		+= sp/
 ifneq ($(CONFIG_IPV6),)
 obj-y				+= ipv6/
 endif
