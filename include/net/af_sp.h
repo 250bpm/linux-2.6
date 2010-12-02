@@ -10,7 +10,10 @@
 struct sp_sock {
         /* WARNING: sk has to be the first member */
         struct sock	sk;
+	struct socket	*peer;
 };
+#define sp_sk(__sk) ((struct sp_sock *)__sk)
+
 #endif
 
 #endif
