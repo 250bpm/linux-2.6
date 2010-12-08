@@ -243,6 +243,8 @@ extern int   	     sock_sendmsg(struct socket *sock, struct msghdr *msg,
 extern int	     sock_recvmsg(struct socket *sock, struct msghdr *msg,
 				  size_t size, int flags);
 extern int 	     sock_map_fd(struct socket *sock, int flags);
+extern int	     sock_map_anon(struct socket *sock, const char *name,
+				   int flags);
 extern struct socket *sockfd_lookup(int fd, int *err);
 #define		     sockfd_put(sock) fput(sock->file)
 extern int	     net_ratelimit(void);

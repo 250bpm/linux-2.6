@@ -1,27 +1,51 @@
 /*
  * SP: An implementation of SP sockets.
+ *
+ * Copyright 2010 VMware, Inc.
+ *
+ * Authors: Martin Sustrik <sustrik@250bpm.com>
+ *	    Martin Lucina <mato@kotelna.sk>
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/socket.h>
 #include <linux/sp.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
 #include <net/af_sp.h>
 
 static int sp_release(struct socket *);
 static int sp_create(struct net *, struct socket *, int, int);
 static void sp_sock_destructor(struct sock *);
-static int sp_connect(struct socket *sock, struct sockaddr *addr,
-	int addr_len, int flags);
-static int sp_pub_sendmsg(struct kiocb *, struct socket *,
-	struct msghdr *, size_t);
+static int sp_connect(struct socket *, struct sockaddr *, int, int);
+static int sp_bind(struct socket *, struct sockaddr *, int);
+static int sp_pub_sendmsg(struct kiocb *, struct socket *, struct msghdr *,
+	size_t);
+static int sp_pub_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
+	size_t, int);
 
+/* SP protocol information */
+static struct proto sp_proto = {
+	.name =		"SP",
+	.owner =	THIS_MODULE,
+	.obj_size =	sizeof(struct sp_sock),
+};
+
+/* SP protocol family operations */
+static const struct net_proto_family sp_family_ops = {
+	.family =	PF_SP,
+	.create =	sp_create,
+	.owner =	THIS_MODULE,
+};
+
+/* SP SOCK_PUB socket operations */
 static const struct proto_ops sp_pub_ops = {
-        .family =	PF_SP,
+	.family =	PF_SP,
 	.owner =	THIS_MODULE,
 	.release =	sp_release,
-	.bind =		sock_no_bind,
-	.connect =      sp_connect,
+	.bind =		sp_bind,
+	.connect =	sp_connect,
 	.socketpair =	sock_no_socketpair,
 	.accept =	sock_no_accept,
 	.getname =	sock_no_getname,
@@ -32,52 +56,66 @@ static const struct proto_ops sp_pub_ops = {
 	.setsockopt =	sock_no_setsockopt,
 	.getsockopt =	sock_no_getsockopt,
 	.sendmsg =	sp_pub_sendmsg,
-	.recvmsg =	sock_no_recvmsg,
+	.recvmsg =	sp_pub_recvmsg,
 	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
 };
 
-static struct proto sp_proto = {
-	.name =		"SP",
-	.owner =	THIS_MODULE,
-	.obj_size =	sizeof(struct sp_sock),
-};
-
+/*
+ * sp_sock_destructor: SP socket destructor
+ *
+ * Called when an SP socket is freed.
+ */
 static void sp_sock_destructor(struct sock *sk)
 {
-	/* struct sp_sock *sp = sp_sk(sk); */
+	struct sp_sock *sp = sp_sk(sk);
 
 	printk(KERN_INFO "%s: Here\n", __func__);
 
+	/* Decrement protocol family refcount */
 	local_bh_disable();
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
 	local_bh_enable();
 }
 
+/*
+ * sp_release: Close an SP socket
+ */
 static int sp_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
-
-	printk(KERN_INFO "%s: Here\n", __func__);
+	struct sp_sock *sp = sp_sk(sk);
 
 	if (!sk)
 		return 0;
+
+	sock_hold(sk);
+
+	poll_freewait(&sp->pollset);
+	if (sp->peer) {
+		sock_release(sp->peer);
+		sp->peer = NULL;
+	}
+
+	sock_orphan(sk);
+	sock_put(sk);
 
 	sock->sk = NULL;
 
 	return 0;
 }
 
+/*
+ * sp_create: Create an unconnected SP socket
+ */
 static int sp_create(struct net *net, struct socket *sock, int protocol,
-                     int kern)
+	int kern)
 {
 	struct sock *sk = NULL;
 	struct sp_sock *sp;
 
 	if (protocol && protocol != PF_SP)
 		return -EPROTONOSUPPORT;
-
-	printk(KERN_INFO "%s: Here\n", __func__);
 
 	switch (sock->type) {
 	case SOCK_PUB:
@@ -87,62 +125,81 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 		return -ESOCKTNOSUPPORT;
 	}
 
+	/* Initial state is not connected */
 	sock->state = SS_UNCONNECTED;
 
+	/* Allocate SP private data */
 	sk = sk_alloc(net, PF_SP, GFP_KERNEL, &sp_proto);
 	if (!sk)
-	    return -ENOMEM;
+		return -ENOMEM;
 	sock_init_data(sock, sk);
-	/* lockdep_set_class(&sk->sk_receive_queue.lock,
-				&af_unix_sk_receive_queue_lock_key);
+	sk->sk_destruct	= sp_sock_destructor;
+	sp = sp_sk(sk);
+	sp->peer = NULL;
+	poll_initwait(&sp->pollset);
 
-	sk->sk_write_space	= unix_write_space;
-	sk->sk_max_ack_backlog	= net->unx.sysctl_max_dgram_qlen; */
-	sk->sk_destruct		= sp_sock_destructor;
-	sp        = sp_sk(sk);
-	sp->peer  = NULL;
-
+	/* Increment procotol family refcount */
 	local_bh_disable();
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
 	local_bh_enable();
+
 	return 0;
 }
 
+/*
+ * sp_bind: Bind SP socket to an endpoint 
+ */
+static int sp_bind(struct socket *sock, struct sockaddr *addr,
+	int addr_len)
+{
+	return -EOPNOTSUPP;
+}
+
+/*
+ * sp_connect: Connect SP socket to an endpoint
+ */
 static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	int addr_len, int flags)
 {
 	struct sock *sk = sock->sk;
 	struct sockaddr_sp *sp_addr = (struct sockaddr_sp *)addr;
 	struct sp_sock *sp = sp_sk(sk);
-	int err;
+	int rc;
 	struct sockaddr_in peer_addr;
 
-	printk(KERN_CRIT "%s: endpoint is %s\n", __func__,
-		sp_addr->ssp_endpoint);
+	/* Create peer socket and associated file structure */
+	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->peer);
+	if (rc < 0)
+		goto out;
+	rc = sock_map_anon(sp->peer, "[sp]", 0);
+	/* rc = sock_map_fd(sp->peer, O_CLOEXEC); */
+	if (rc < 0)
+		goto out_release;
 
-	err = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->peer);
-	if (err < 0) {
-		printk(KERN_INFO "%s: cannot create peer socket: %d\n",
-			__func__, -err);
-		return err;
-	}
-
+	/* Connect peer socket */
 	peer_addr.sin_family = AF_INET;
 	peer_addr.sin_addr.s_addr = htonl(0x7F000001);
 	peer_addr.sin_port = htons(3333);
-	err = kernel_connect(sp->peer, (struct sockaddr *) &peer_addr,
+	rc = kernel_connect(sp->peer, (struct sockaddr *) &peer_addr,
 		sizeof peer_addr, 0);
-	if (err < 0) {
-		printk(KERN_INFO "%s: cannot connect peer socket: %d\n",
-			__func__, -err);
-		sock_release(sp->peer);
-		return err;
-	}
-
+	if (rc < 0)
+		goto out_release;
+	
+	/* Socket is now connected */
 	sock->state = SS_CONNECTED;
+
 	return 0;
+
+out_release:
+	sock_release(sp->peer);
+	sp->peer = NULL;
+out:
+	return rc;
 }
 
+/*
+ * sp_pub_sendmsg: Send a message to a SOCK_PUB socket
+ */
 static int sp_pub_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	struct msghdr *msg, size_t len)
 {
@@ -177,12 +234,41 @@ static int sp_pub_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	return nbytes;
 }
 
-static const struct net_proto_family sp_family_ops = {
-	.family =	PF_SP,
-	.create =	sp_create,
-	.owner =	THIS_MODULE,
-};
+/*
+ * sp_pub_recvmsg: Receive a message from a SOCK_PUB socket
+ */
+static int sp_pub_recvmsg(struct kiocb *iocb, struct socket *sock,
+			  struct msghdr *msg, size_t size, int flags)
+{
+	struct sock *sk = sock->sk;
+	struct sp_sock *sp = sp_sk(sk);
+	int revents;
 
+	if (sock->state != SS_CONNECTED)
+		return -ENOTCONN;
+
+	printk(KERN_INFO "%s: before poll loop \n", __func__);
+
+	while (1) {
+		revents = sp->peer->file->f_op->poll(sp->peer->file,
+			&sp->pollset.pt);
+		if (revents & POLLIN)
+			break;
+		if (signal_pending(current)) {
+			return -EINTR;
+		}
+		poll_schedule(&sp->pollset, TASK_INTERRUPTIBLE);
+		printk(KERN_INFO "%s: in poll loop \n", __func__);
+	}
+
+	printk(KERN_INFO "%s: after poll loop \n", __func__);
+
+	return 0;
+}
+
+/*
+ * af_sp_init: Intialise SP protocol family
+ */
 static int __init af_sp_init(void)
 {
 	int rc = -1;
@@ -190,8 +276,8 @@ static int __init af_sp_init(void)
 	rc = proto_register(&sp_proto, 1);
 	if (rc != 0) {
 		printk(KERN_CRIT "%s: Cannot create sp_sock SLAB cache!\n",
-		       __func__);
-        	goto out;
+			__func__);
+		goto out;
 	}
 
 	sock_register(&sp_family_ops);
@@ -199,6 +285,9 @@ out:
 	return rc;
 }
 
+/*
+ * af_sp_exit: Uninitialise SP procotol family
+ */
 static void __exit af_sp_exit(void)
 {
 	sock_unregister(PF_SP);

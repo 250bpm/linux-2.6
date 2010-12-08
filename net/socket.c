@@ -88,6 +88,7 @@
 #include <linux/nsproxy.h>
 #include <linux/magic.h>
 #include <linux/slab.h>
+#include <linux/anon_inodes.h>
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
@@ -403,6 +404,16 @@ int sock_map_fd(struct socket *sock, int flags)
 	return fd;
 }
 EXPORT_SYMBOL(sock_map_fd);
+
+int sock_map_anon(struct socket *sock, const char *name, int flags)
+{
+	struct file *newfile;
+	
+	newfile = anon_inode_getfile(name, &socket_file_ops, sock, flags);
+	sock->file = newfile;
+	return 0;
+}
+EXPORT_SYMBOL(sock_map_anon);
 
 static struct socket *sock_from_file(struct file *file, int *err)
 {
