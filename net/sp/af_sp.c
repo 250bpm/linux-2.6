@@ -162,10 +162,16 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	int addr_len, int flags)
 {
 	struct sock *sk = sock->sk;
-	struct sockaddr_sp *sp_addr = (struct sockaddr_sp *)addr;
+	struct sockaddr_in *addr_in;
 	struct sp_sock *sp = sp_sk(sk);
 	int rc;
-	struct sockaddr_in peer_addr;
+
+	/* Only AF_INET addressing is supported for now */
+	if (addr->sa_family != AF_INET) {
+		rc = -EAFNOSUPPORT;
+		goto out;
+	}
+	addr_in = (struct sockaddr_in *)addr;
 
 	/* Create peer socket and associated file structure */
 	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->peer);
@@ -177,11 +183,7 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 		goto out_release;
 
 	/* Connect peer socket */
-	peer_addr.sin_family = AF_INET;
-	peer_addr.sin_addr.s_addr = htonl(0x7F000001);
-	peer_addr.sin_port = htons(3333);
-	rc = kernel_connect(sp->peer, (struct sockaddr *) &peer_addr,
-		sizeof peer_addr, 0);
+	rc = kernel_connect(sp->peer, addr, addr_len, 0);
 	if (rc < 0)
 		goto out_release;
 	
