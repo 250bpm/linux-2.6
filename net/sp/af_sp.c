@@ -14,6 +14,7 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <net/af_sp.h>
+#include <linux/err.h>
 
 static int sp_release(struct socket *);
 static int sp_create(struct net *, struct socket *, int, int);
@@ -22,7 +23,7 @@ static int sp_connect(struct socket *, struct sockaddr *, int, int);
 static int sp_bind(struct socket *, struct sockaddr *, int);
 static int sp_pub_sendmsg(struct kiocb *, struct socket *, struct msghdr *,
 	size_t);
-static int sp_pub_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
+static int sp_sub_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
 	size_t, int);
 
 /* SP protocol information */
@@ -56,7 +57,29 @@ static const struct proto_ops sp_pub_ops = {
 	.setsockopt =	sock_no_setsockopt,
 	.getsockopt =	sock_no_getsockopt,
 	.sendmsg =	sp_pub_sendmsg,
-	.recvmsg =	sp_pub_recvmsg,
+	.recvmsg =	sock_no_recvmsg,
+	.mmap =		sock_no_mmap,
+	.sendpage =	sock_no_sendpage,
+};
+
+/* SP SOCK_SUB socket operations */
+static const struct proto_ops sp_sub_ops = {
+	.family =	PF_SP,
+	.owner =	THIS_MODULE,
+	.release =	sp_release,
+	.bind =		sp_bind,
+	.connect =	sp_connect,
+	.socketpair =	sock_no_socketpair,
+	.accept =	sock_no_accept,
+	.getname =	sock_no_getname,
+	.poll =		sock_no_poll,
+	.ioctl =	sock_no_ioctl,
+	.listen =	sock_no_listen,
+	.shutdown =	sock_no_shutdown,
+	.setsockopt =	sock_no_setsockopt,
+	.getsockopt =	sock_no_getsockopt,
+	.sendmsg =	sock_no_sendmsg,
+	.recvmsg =	sp_sub_recvmsg,
 	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
 };
@@ -93,7 +116,8 @@ static int sp_release(struct socket *sock)
 
 	poll_freewait(&sp->pollset);
 	if (sp->peer) {
-		sock_release(sp->peer);
+		sock_release(sp->peer->s);
+		kfree(sp->peer);
 		sp->peer = NULL;
 	}
 
@@ -121,6 +145,9 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	case SOCK_PUB:
 		sock->ops = &sp_pub_ops;
 		break;
+	case SOCK_SUB:
+		sock->ops = &sp_sub_ops;
+		break;
 	default:
 		return -ESOCKTNOSUPPORT;
 	}
@@ -137,6 +164,7 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	sp = sp_sk(sk);
 	sp->peer = NULL;
 	poll_initwait(&sp->pollset);
+        mutex_init(&sp->sync_mutex);
 
 	/* Increment procotol family refcount */
 	local_bh_disable();
@@ -173,28 +201,41 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	}
 	addr_in = (struct sockaddr_in *)addr;
 
+	mutex_lock(&sp->sync_mutex);
+
 	/* Create peer socket and associated file structure */
-	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->peer);
-	if (rc < 0)
+        sp->peer = kmalloc(sizeof (struct sp_peer), GFP_KERNEL);
+        if (!sp->peer) {
+		rc = -ENOMEM;
 		goto out;
-	rc = sock_map_anon(sp->peer, "[sp]", 0);
-	/* rc = sock_map_fd(sp->peer, O_CLOEXEC); */
+	}
+	sp->peer->recv_state = RSTATE_MSGSTART;
+	sp->peer->recv_buf = NULL;
+	sp->peer->recv_size = 0;
+
+	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->peer->s);
+	if (rc < 0)
+		goto out_unlock;
+	rc = sock_map_anon(sp->peer->s, "[sp]", 0);
+	/* rc = sock_map_fd(sp->peer->s, O_CLOEXEC); */
 	if (rc < 0)
 		goto out_release;
 
 	/* Connect peer socket */
-	rc = kernel_connect(sp->peer, addr, addr_len, 0);
+	rc = kernel_connect(sp->peer->s, addr, addr_len, 0);
 	if (rc < 0)
 		goto out_release;
 	
 	/* Socket is now connected */
 	sock->state = SS_CONNECTED;
-
-	return 0;
+	rc = 0;
+	goto out_unlock;
 
 out_release:
-	sock_release(sp->peer);
+	sock_release(sp->peer->s);
 	sp->peer = NULL;
+out_unlock:
+	mutex_unlock(&sp->sync_mutex);
 out:
 	return rc;
 }
@@ -231,41 +272,85 @@ static int sp_pub_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	send_msg.msg_control = NULL;
 	send_msg.msg_controllen = 0;
 	send_msg.msg_flags = 0;
-	nbytes = kernel_sendmsg(sp->peer, &send_msg, &send_vec, 1, len);
+	nbytes = kernel_sendmsg(sp->peer->s, &send_msg, &send_vec, 1, len);
 	kfree (send_vec.iov_base);
 	return nbytes;
 }
 
 /*
- * sp_pub_recvmsg: Receive a message from a SOCK_PUB socket
+ * sp_sub_recvmsg: Receive a message from a SOCK_SUB socket
  */
-static int sp_pub_recvmsg(struct kiocb *iocb, struct socket *sock,
+static int sp_sub_recvmsg(struct kiocb *iocb, struct socket *sock,
 			  struct msghdr *msg, size_t size, int flags)
 {
 	struct sock *sk = sock->sk;
 	struct sp_sock *sp = sp_sk(sk);
-	int revents;
+	int revents, rc;
+	struct msghdr hdr;
+	struct kvec vec;
+	int nbytes;
 
 	if (sock->state != SS_CONNECTED)
 		return -ENOTCONN;
 
-	printk(KERN_INFO "%s: before poll loop \n", __func__);
+	mutex_lock(&sp->sync_mutex);
 
-	while (1) {
-		revents = sp->peer->file->f_op->poll(sp->peer->file,
-			&sp->pollset.pt);
-		if (revents & POLLIN)
-			break;
-		if (signal_pending(current)) {
-			return -EINTR;
+	if (sp->peer->recv_state == RSTATE_MSGSTART) {
+		/* Poll for incoming data on peer socket */
+		while (1) {
+			revents = sp->peer->s->file->f_op->poll(
+				sp->peer->s->file,
+				&sp->pollset.pt);
+			if (revents & POLLIN)
+				break;
+			if (signal_pending(current)) {
+				rc = -EINTR;
+				goto out;
+			}
+			poll_schedule(&sp->pollset, TASK_INTERRUPTIBLE);
 		}
-		poll_schedule(&sp->pollset, TASK_INTERRUPTIBLE);
-		printk(KERN_INFO "%s: in poll loop \n", __func__);
+	
+		/* Receive message size */
+		memset (&hdr, 0, sizeof hdr);
+		vec.iov_base = &sp->peer->recv_size;
+		vec.iov_len = 1;
+		nbytes = kernel_recvmsg(sp->peer->s, &hdr, &vec, 1, 1,
+			MSG_DONTWAIT);
+		BUG_ON(nbytes != 1);
+		sp->peer->recv_state = RSTATE_MSGDATA;
+
+		/* Receive message data */
+		memset (&hdr, 0, sizeof hdr);
+		sp->peer->recv_buf = kmalloc(sp->peer->recv_size, GFP_KERNEL);
+		if (!sp->peer->recv_buf) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		vec.iov_base = sp->peer->recv_buf;
+		vec.iov_len = sp->peer->recv_size;
+		/* Destructively modifies vec! */
+		nbytes = kernel_recvmsg(sp->peer->s, &hdr, &vec, 1,
+			sp->peer->recv_size, 0);
+		
+		sp->peer->recv_state = RSTATE_MSGREADY;
 	}
 
-	printk(KERN_INFO "%s: after poll loop \n", __func__);
+	if (size < sp->peer->recv_size) {
+		rc = -EMSGSIZE;
+		goto out;
+	}
+	rc = memcpy_toiovec(msg->msg_iov, sp->peer->recv_buf,
+		sp->peer->recv_size);
+	if (rc < 0)
+		goto out;
 
-	return 0;
+	kfree(sp->peer->recv_buf);
+	sp->peer->recv_state = RSTATE_MSGSTART;
+	rc = sp->peer->recv_size;
+
+out:
+	mutex_unlock(&sp->sync_mutex);
+	return rc;
 }
 
 /*
