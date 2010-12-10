@@ -15,6 +15,7 @@
 #include <linux/poll.h>
 #include <net/af_sp.h>
 #include <linux/err.h>
+#include <linux/workqueue.h>
 
 static int sp_release(struct socket *);
 static int sp_create(struct net *, struct socket *, int, int);
@@ -25,6 +26,8 @@ static int sp_pub_sendmsg(struct kiocb *, struct socket *, struct msghdr *,
 	size_t);
 static int sp_sub_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
 	size_t, int);
+static void sp_bind_cb(struct sock *sk, int bytes);
+static void sp_newconn_task(struct work_struct *work);
 
 /* SP protocol information */
 static struct proto sp_proto = {
@@ -82,6 +85,12 @@ static const struct proto_ops sp_sub_ops = {
 	.recvmsg =	sp_sub_recvmsg,
 	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
+};
+
+/* SP work item */
+struct sp_work_item {
+	struct work_struct work_item;
+	struct socket *s;
 };
 
 /*
@@ -180,7 +189,119 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 static int sp_bind(struct socket *sock, struct sockaddr *addr,
 	int addr_len)
 {
-	return -EOPNOTSUPP;
+	struct sock *sk = sock->sk;
+	struct sockaddr_in *addr_in;
+	struct sp_sock *sp = sp_sk(sk);
+	int rc;
+
+	/* Only a single peer supported for now */
+	if (sock->state != SS_UNCONNECTED) {
+		rc = -EISCONN;
+		goto out;
+	}
+	/* Only AF_INET addressing is supported for now */
+	if (addr->sa_family != AF_INET) {
+		rc = -EAFNOSUPPORT;
+		goto out;
+	}
+	addr_in = (struct sockaddr_in *)addr;
+
+	mutex_lock(&sp->sync_mutex);
+
+	/* Create listener socket and associated file structure */
+	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->listener);
+	if (rc < 0)
+		goto out_unlock;
+	rc = sock_map_anon(sp->listener, "[sp]", 0);
+	if (rc < 0)
+		goto out_release;
+	printk(KERN_INFO "%s: socket = %p socket->sk->sk_socket = %p\n", __func__,
+		sp->listener, sp->listener->sk->sk_socket);
+	
+	/* Install callback to be called when a new connection arrives */
+	sp->listener->sk->sk_user_data = sk;
+	sp->listener->sk->sk_data_ready = sp_bind_cb;
+
+	/* Bind and listen for connections on listener socket */
+	rc = kernel_bind(sp->listener, addr, addr_len);
+	if (rc < 0)
+		goto out_release;
+	rc = kernel_listen(sp->listener, 1);
+	if (rc < 0)
+		goto out_release;
+	
+	/* Socket is now bound, connections will be accepted asynchronously */
+	rc = 0;
+	goto out_unlock;
+
+out_release:
+	sock_release(sp->listener);
+	sp->listener = NULL;
+out_unlock:
+	mutex_unlock(&sp->sync_mutex);
+out:
+	return rc;
+}
+
+/*
+ * sp_bind_cb: Callback called from sp->listener->sk_data_ready
+ */
+static void sp_bind_cb(struct sock *sk, int bytes)
+{
+	/* All we do here is schedule a work item to accept the connection */
+	struct sp_work_item *sp_work;
+
+	printk(KERN_INFO "%s: Here\n", __func__);
+
+	sp_work = kmalloc(sizeof (struct sp_work_item), GFP_KERNEL);
+	if (!sp_work)
+		return;
+	INIT_WORK(&sp_work->work_item, sp_newconn_task);
+	sp_work->s = sk->sk_socket;
+	sk->sk_data_ready = NULL;
+	schedule_work(&sp_work->work_item);
+}
+
+/*
+ * sp_newconn_task: Work handler to accept a new connection
+ */
+static void sp_newconn_task(struct work_struct *work)
+{
+	struct sp_work_item *sp_work = container_of(work, struct sp_work_item, work_item);
+	struct socket *listener = sp_work->s;
+	struct socket *peer;
+	struct sock *sk = (struct sock *)sp_work->s->sk->sk_user_data;
+	struct sp_sock *sp = sp_sk(sk);
+	struct sp_peer *sp_peer;
+	int rc;
+
+	printk(KERN_INFO "%s: Here\n", __func__);
+	return;
+
+	/* Accept the new connection */
+	rc = kernel_accept(listener, &peer, 0);
+	if (rc < 0) {
+		printk(KERN_INFO "%s: accept returned %d\n", __func__, -rc);
+		return;
+	}
+       
+	/* Allocate space for peer connection */
+	sp_peer = kmalloc(sizeof (struct sp_peer), GFP_KERNEL);
+        if (!sp_peer) {
+		sock_release(peer);
+		return;
+	}
+
+	/* Peer socket is now ready, link it to parent SP socket */
+	mutex_lock(&sp->sync_mutex);
+	sp->peer->s = peer;
+	sp->peer->recv_state = RSTATE_MSGSTART;
+	sp->peer->recv_buf = NULL;
+	sp->peer->recv_size = 0;
+	sk->sk_socket->state = SS_CONNECTED;
+	mutex_unlock(&sp->sync_mutex);
+
+	return;
 }
 
 /*

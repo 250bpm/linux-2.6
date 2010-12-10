@@ -39,10 +39,15 @@ struct sp_sock {
         struct mutex sync_mutex;
 	/* Peer connection */
 	struct sp_peer *peer;
+	/* Listener socket, for bind */
+	struct socket *listener;
 };
 
 /* Accessor for sp_sock from generic socket */
 #define sp_sk(__sk) ((struct sp_sock *)__sk)
+
+/* Accessor for sp_sock from peer struct sock */
+#define sp_parent(__p) ((struct sock *)__p)
 
 #endif
 
