@@ -194,6 +194,11 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	struct sp_sock *sp = sp_sk(sk);
 	int rc;
 
+	/* Only a single peer supported for now */
+	if (sock->state != SS_UNCONNECTED) {
+		rc = -EISCONN;
+		goto out;
+	}
 	/* Only AF_INET addressing is supported for now */
 	if (addr->sa_family != AF_INET) {
 		rc = -EAFNOSUPPORT;
@@ -248,33 +253,67 @@ static int sp_pub_sendmsg(struct kiocb *kiocb, struct socket *sock,
 {
 	struct sock *sk = sock->sk;
 	struct sp_sock *sp = sp_sk(sk);
-	struct kvec send_vec;
-	struct msghdr send_msg;
+	int revents, rc;
+	struct msghdr hdr;
+	struct kvec vec;
 	int nbytes;
-
-	if (msg->msg_iovlen != 1)
-		return -EOPNOTSUPP;
+	unsigned char send_size;
+	unsigned char *send_buf;
 
 	if (sock->state != SS_CONNECTED)
 		return -ENOTCONN;
+	if (len > 255)
+		return -EMSGSIZE;
 
-	send_vec.iov_base = kmalloc (len, GFP_KERNEL);
-	if (!send_vec.iov_base)
-		return -ENOMEM;
-	if (copy_from_user(send_vec.iov_base,
-		msg->msg_iov[0].iov_base, len) != 0) {
-		kfree(send_vec.iov_base);
-		return -EFAULT; /* ? */
+	mutex_lock(&sp->sync_mutex);
+
+	/* Poll for send space on peer socket */
+	while (1) {
+		revents = sp->peer->s->file->f_op->poll(
+			sp->peer->s->file,
+			&sp->pollset.pt);
+		if (revents & POLLOUT)
+			break;
+		if (signal_pending(current)) {
+			rc = -EINTR;
+			goto out;
+		}
+		poll_schedule(&sp->pollset, TASK_INTERRUPTIBLE);
 	}
-	send_vec.iov_len = len;
-	send_msg.msg_name = NULL;
-	send_msg.msg_namelen = 0;
-	send_msg.msg_control = NULL;
-	send_msg.msg_controllen = 0;
-	send_msg.msg_flags = 0;
-	nbytes = kernel_sendmsg(sp->peer->s, &send_msg, &send_vec, 1, len);
-	kfree (send_vec.iov_base);
-	return nbytes;
+
+	/* Allocate buffer space for message to send and copy from user */
+	send_size = (unsigned char)len;
+	send_buf = kmalloc(send_size, GFP_KERNEL);
+	if (!send_buf) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	rc = memcpy_fromiovecend(send_buf, msg->msg_iov, 0, send_size);
+	if (rc < 0)
+		goto out_free;
+
+	/* Send message size */
+	printk(KERN_INFO "%s: before send data\n", __func__);
+	memset (&hdr, 0, sizeof hdr);
+	vec.iov_base = &send_size;
+	vec.iov_len = 1;
+	nbytes = kernel_sendmsg(sp->peer->s, &hdr, &vec, 1, 1);
+	printk(KERN_INFO "%s: after send data\n", __func__);
+	BUG_ON(nbytes != 1);
+
+	/* Send message data */
+	memset (&hdr, 0, sizeof hdr);
+	vec.iov_base = send_buf;
+	vec.iov_len = send_size;
+	nbytes = kernel_sendmsg(sp->peer->s, &hdr, &vec, 1, send_size);
+	BUG_ON(nbytes < send_size);
+
+	rc = send_size;
+out_free:
+	kfree(send_buf);
+out:
+	mutex_unlock(&sp->sync_mutex);
+	return rc;
 }
 
 /*
