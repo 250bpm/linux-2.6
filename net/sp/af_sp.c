@@ -145,7 +145,48 @@ static int sp_parse_address (const char *string, int *protocol,
 
 static void sp_data_work_in(struct work_struct *work)
 {
+	struct sp_usock *usock = container_of(work,
+		struct sp_usock, work_in);
+	struct kvec vec;
+	struct msghdr hdr;
+	unsigned char size;
+	int nbytes;
+
 	printk(KERN_INFO "SP: In");
+
+	/*  If there's no message, read the size and allocate the buffer */
+	if (usock->inmsg_data == NULL) {
+		memset (&hdr, 0, sizeof hdr);
+		vec.iov_base = &size;
+		vec.iov_len = 1;
+		nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, 1,
+			MSG_DONTWAIT);
+		if (nbytes == 0)
+			return;
+		BUG_ON (nbytes != 1);
+
+		usock->inmsg_data = kmalloc(size, GFP_KERNEL);
+	        BUG_ON (!usock->inmsg_data);
+		usock->inmsg_size = size;
+		usock->inmsg_pos = 0;
+		printk(KERN_INFO "SP: Size %d received", (int) size);
+        }
+
+	/*  If the message is fully read there's nothing more to do */
+	if (usock->inmsg_pos == usock->inmsg_size)
+		return;
+
+	/* Try to read the remaining part of the message */
+	memset (&hdr, 0, sizeof hdr);
+	vec.iov_base = (char *)usock->inmsg_data + usock->inmsg_pos;
+	vec.iov_len = usock->inmsg_size - usock->inmsg_pos;
+	nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, vec.iov_len,
+		MSG_DONTWAIT);
+	BUG_ON(nbytes < 0);
+	usock->inmsg_pos += nbytes;
+	if (usock->inmsg_pos == usock->inmsg_size)
+			printk(KERN_INFO "SP: Message fully read (%d bytes)",
+				(int)usock->inmsg_size);
 }
 
 static void sp_data_work_out(struct work_struct *work)
@@ -160,6 +201,11 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	struct list_head *list, void (*infunc)(struct work_struct*),
 	void (*outfunc)(struct work_struct*))
 {
+	/* Basic initialisation */
+	usock->inmsg_data = NULL;
+	usock->inmsg_size = 0;
+	usock->inmsg_pos = 0;
+
 	/* Install callback to be called when a new connection arrives */
 	usock->s->sk->sk_user_data = (void *)usock;
 	INIT_WORK(&usock->work_in, infunc);

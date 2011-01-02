@@ -26,6 +26,10 @@ struct sp_usock {
         /* Work performed on behalf of this socket */
         struct work_struct work_in;
         struct work_struct work_out;
+	/* The inbound message being received at the moment */
+        void *inmsg_data;
+        int inmsg_size;
+        int inmsg_pos;
 };
 
 /* The AF_SP socket private data */
