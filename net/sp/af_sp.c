@@ -18,6 +18,9 @@
 #include <linux/err.h>
 #include <linux/in.h>
 
+/* Underlying protocol constants */
+#define SP_PROTOCOL_TCP 1
+
 static int sp_create(struct net *, struct socket *, int, int);
 static void sp_destruct(struct sock *);
 static int sp_release(struct socket *sock);
@@ -66,45 +69,76 @@ static const struct proto_ops sp_sock_ops = {
 	.sendpage =	sock_no_sendpage,
 };
 
-static int sp_parse_tcp_address (const char *string, struct sockaddr_in *addr)
+/*
+ * sp_parse_address: convert textual address into corresponding structure
+ */
+static int sp_parse_address (const char *string, int *protocol,
+	struct sockaddr_storage *addr, int *addr_len)
 {
 	int i, seg;
+	char *pos;
+	struct sockaddr_in *addr_in;
 
-	/* First, set the address family */
-	addr->sin_family = AF_INET;
-
-	/* Parse the "192.168.0.1"-style IP address */
-	addr->sin_addr.s_addr = 0;
-	for(i = 0; i != 4; i++) {
-		seg = 0;
-                while(*string >= '0' && *string <= '9') {
-			seg = seg * 10 + *string - '0';
-			string++;
-			if(seg > 0xff)
-				return -EINVAL;
-		}
-		if(i < 3 && *string != '.')
-			return -EINVAL;
-		if(i == 3 && *string != ':')
-			return -EINVAL;
-		string++;
-		addr->sin_addr.s_addr <<= 8;
-		addr->sin_addr.s_addr |= seg;
-	}
-	addr->sin_addr.s_addr = htonl (addr->sin_addr.s_addr);
-
-	/* Now parse the port number */
-	seg = 0;
-	while (*string >= '0' && *string <= '9') {
-		seg = seg * 10 + *string - '0';
-		string++;
-		if (seg > 0xffff)
-			return -EINVAL;
-
-	}
-	if (*string != 0)
+	/* Split the connection string to protocol and address parts */
+	/* TODO: check whether strchr doesn't exceed the address length */
+	pos = strchr (string, ':');
+	if (pos == NULL)
 		return -EINVAL;
-	addr->sin_port = htons(seg);
+	pos++;
+	if (*pos != '/')
+		return -EINVAL;
+	pos++;
+	if (*pos != '/')
+		return -EINVAL;
+	pos++;
+
+	if (pos - string == 6 && strncmp(string, "tcp://", 6) == 0) {
+
+		/* TCP */
+		*protocol = SP_PROTOCOL_TCP;
+                addr_in = (struct sockaddr_in *)addr;
+                *addr_len = sizeof(struct sockaddr_in);		
+
+		/* First, set the address family */
+		addr_in->sin_family = AF_INET;
+
+		/* Parse the "192.168.0.1"-style IP address */
+		addr_in->sin_addr.s_addr = 0;
+		for(i = 0; i != 4; i++) {
+			seg = 0;
+		        while(*pos >= '0' && *pos <= '9') {
+				seg = seg * 10 + *pos - '0';
+				pos++;
+				if(seg > 0xff)
+					return -EINVAL;
+			}
+			if(i < 3 && *pos != '.')
+				return -EINVAL;
+			if(i == 3 && *pos != ':')
+				return -EINVAL;
+			pos++;
+			addr_in->sin_addr.s_addr <<= 8;
+			addr_in->sin_addr.s_addr |= seg;
+		}
+		addr_in->sin_addr.s_addr = htonl (addr_in->sin_addr.s_addr);
+
+		/* Now parse the port number */
+		seg = 0;
+		while (*pos >= '0' && *pos <= '9') {
+			seg = seg * 10 + *pos - '0';
+			pos++;
+			if (seg > 0xffff)
+				return -EINVAL;
+
+		}
+		if (*pos != 0)
+			return -EINVAL;
+		addr_in->sin_port = htons(seg);
+	}
+	else {
+		/* Unsupported underlying protocol */
+		return -ENOTSUPP;
+	}
 
 	return 0;
 }
@@ -229,11 +263,10 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 	struct sock *sk = sock->sk;
 	struct sp_sock *sp = (struct sp_sock *)sk;
         struct sockaddr_sp *addr_sp;
-        struct sp_usock *listener;
-        struct sockaddr_storage native_addr;
-        int native_addr_len;
-        struct sockaddr_in *addr_in;
-        char *pos;
+        struct sp_usock *usock;
+	int protocol;
+        struct sockaddr_storage uaddr;
+        int uaddr_len;
 	int rc;
 
 	/* Cast the address to proper SP address */
@@ -245,74 +278,54 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 
 	printk(KERN_INFO "SP: Binding to %s", addr_sp->ssp_endpoint);
 
-	/* Separate the connection string to protocol and address parts */
-	/* TODO: check whether strchr doesn't exceed the address length */
-	pos = strchr (addr_sp->ssp_endpoint, ':');
-	if (pos == NULL) {
-		rc = -EINVAL;
+	/* Convert the textual address into a structure */
+	rc = sp_parse_address (addr_sp->ssp_endpoint, &protocol,
+		&uaddr, &uaddr_len);
+	if (rc < 0)
 		goto out;
-	}
-	pos++;
-	if (*pos != '/') {
-		rc = -EINVAL;
-		goto out;
-	}
-	pos++;
-	if (*pos != '/') {
-		rc = -EINVAL;
-		goto out;
-	}
-	pos++;
-
-	if (pos - addr_sp->ssp_endpoint == 6 &&
-		strncmp(addr_sp->ssp_endpoint, "tcp://", 6) == 0) {
-
-		/* Let's just hard-wire the address for now */
-                addr_in = (struct sockaddr_in *)&native_addr;
-		rc = sp_parse_tcp_address(pos, addr_in);
-		if (rc < 0)
-			goto out;
-                native_addr_len = sizeof(struct sockaddr_in);		
-        }
-	else {
-		/* Unsupported undelying protocol */
-		rc = -ENOTSUPP;
-		goto out;
-	}
 
         /* Allocate and initialise the underlying socket */
-        listener = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
-        if (!listener) {
+        usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
+        if (!usock) {
 		rc = -ENOMEM;
                 goto out;
         }
-	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &listener->s);
-	if (rc < 0)
-		goto out_dealloc;
 
-	/* Register the TCP listener socket with the SP socket */
-        sp_register_usock (sp, listener, &sp->listeners,
-		sp_listener_work_in, NULL);
+	if (protocol == SP_PROTOCOL_TCP) {
+		rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP,
+			&usock->s);
+		if (rc < 0)
+			goto out_dealloc;
 
-	/* Bind and listen for connections on listener socket */
-	rc = kernel_bind(listener->s, (struct sockaddr *)&native_addr,
-		native_addr_len);
-	if (rc < 0)
-		goto out_release;
+		/* Register the TCP listener socket with the SP socket */
+		sp_register_usock (sp, usock, &sp->listeners,
+			sp_listener_work_in, NULL);
 
-	rc = kernel_listen(listener->s, 1);
-	if (rc < 0)
-		goto out_release;
+		/* Bind and listen for connections on listener socket */
+		rc = kernel_bind(usock->s, (struct sockaddr *)&uaddr,
+			uaddr_len);
+		if (rc < 0)
+			goto out_release;
+
+		rc = kernel_listen(usock->s, 1);
+		if (rc < 0)
+			goto out_release;
+	}
+	else {
+		/* This should not happen. If parsing was successfull */
+		/* we should be able to bind */
+		BUG();
+	}
 	
 	/* Socket is now bound, connections will be accepted asynchronously */
 	rc = 0;
 	goto out;
 
 out_release:
-	sock_release(listener->s);
-        list_del(&listener->list);
+	sock_release(usock->s);
+        list_del(&usock->list);
 out_dealloc:
-        kfree(listener);
+        kfree(usock);
 out:
 	return rc;
 }
@@ -323,7 +336,70 @@ out:
 static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	int addr_len, int flags)
 {
-	return -ENOTSUPP;
+	struct sock *sk = sock->sk;
+	struct sp_sock *sp = (struct sp_sock *)sk;
+        struct sockaddr_sp *addr_sp;
+        struct sp_usock *usock;
+	int protocol;
+        struct sockaddr_storage uaddr;
+        int uaddr_len;
+	int rc;
+
+	/* Cast the address to proper SP address */
+	if (addr->sa_family != AF_SP) {
+		rc = -EAFNOSUPPORT;
+		goto out;
+	}
+	addr_sp = (struct sockaddr_sp *)addr;
+
+	printk(KERN_INFO "SP: Connecting to %s", addr_sp->ssp_endpoint);
+
+	/* Convert the textual address into a structure */
+	rc = sp_parse_address (addr_sp->ssp_endpoint, &protocol,
+		&uaddr, &uaddr_len);
+	if (rc < 0)
+		goto out;
+
+        /* Allocate and initialise the underlying socket */
+        usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
+        if (!usock) {
+		rc = -ENOMEM;
+                goto out;
+        }
+
+	if (protocol == SP_PROTOCOL_TCP) {
+		rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP,
+			&usock->s);
+		if (rc < 0)
+			goto out_dealloc;
+
+		/* Register the TCP socket with the SP socket */
+		sp_register_usock (sp, usock, &sp->connections,
+			sp_data_work_in, sp_data_work_out);
+
+		/* Start connecting to the peer */
+		rc = kernel_connect(usock->s, (struct sockaddr *)&uaddr,
+			uaddr_len, 0);
+		if (rc < 0)
+			goto out_release;
+	}
+	else {
+		/* This should not happen. If parsing was successfull */
+		/* we should be able to bind */
+		BUG();
+	}
+	
+	/* Socket is now bound, connections will be accepted asynchronously */
+	rc = 0;
+	goto out;
+
+out_release:
+	sock_release(usock->s);
+        list_del(&usock->list);
+out_dealloc:
+        kfree(usock);
+out:
+	return rc;
 }
 
 /*
