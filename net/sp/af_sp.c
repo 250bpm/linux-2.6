@@ -66,6 +66,49 @@ static const struct proto_ops sp_sock_ops = {
 	.sendpage =	sock_no_sendpage,
 };
 
+static int sp_parse_tcp_address (const char *string, struct sockaddr_in *addr)
+{
+	int i, seg;
+
+	/* First, set the address family */
+	addr->sin_family = AF_INET;
+
+	/* Parse the "192.168.0.1"-style IP address */
+	addr->sin_addr.s_addr = 0;
+	for(i = 0; i != 4; i++) {
+		seg = 0;
+                while(*string >= '0' && *string <= '9') {
+			seg = seg * 10 + *string - '0';
+			string++;
+			if(seg > 0xff)
+				return -EINVAL;
+		}
+		if(i < 3 && *string != '.')
+			return -EINVAL;
+		if(i == 3 && *string != ':')
+			return -EINVAL;
+		string++;
+		addr->sin_addr.s_addr <<= 8;
+		addr->sin_addr.s_addr |= seg;
+	}
+	addr->sin_addr.s_addr = htonl (addr->sin_addr.s_addr);
+
+	/* Now parse the port number */
+	seg = 0;
+	while (*string >= '0' && *string <= '9') {
+		seg = seg * 10 + *string - '0';
+		string++;
+		if (seg > 0xffff)
+			return -EINVAL;
+
+	}
+	if (*string != 0)
+		return -EINVAL;
+	addr->sin_port = htons(seg);
+
+	return 0;
+}
+
 static void sp_data_work_in(struct work_struct *work)
 {
 	printk(KERN_INFO "SP: In");
@@ -94,7 +137,7 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 
 	/* Add the new socket to the list of underlying sockets */
         usock->owner = owner;
-	list_add(usock, list);
+	list_add(&usock->list, list);
 }
 
 /*
@@ -202,25 +245,38 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 
 	printk(KERN_INFO "SP: Binding to %s", addr_sp->ssp_endpoint);
 
-	/* Parse the connection string */
+	/* Separate the connection string to protocol and address parts */
 	/* TODO: check whether strchr doesn't exceed the address length */
 	pos = strchr (addr_sp->ssp_endpoint, ':');
 	if (pos == NULL) {
 		rc = -EINVAL;
 		goto out;
 	}
-	if (pos - addr_sp->ssp_endpoint == 3 &&
-		strncmp(addr_sp->ssp_endpoint, "tcp", 3) == 0) {
+	pos++;
+	if (*pos != '/') {
+		rc = -EINVAL;
+		goto out;
+	}
+	pos++;
+	if (*pos != '/') {
+		rc = -EINVAL;
+		goto out;
+	}
+	pos++;
+
+	if (pos - addr_sp->ssp_endpoint == 6 &&
+		strncmp(addr_sp->ssp_endpoint, "tcp://", 6) == 0) {
 
 		/* Let's just hard-wire the address for now */
                 addr_in = (struct sockaddr_in *)&native_addr;
-		addr_in->sin_family = AF_INET;
-		addr_in->sin_addr.s_addr = htonl(0x0a090175);
-		addr_in->sin_port = htons(5555);
+		rc = sp_parse_tcp_address(pos, addr_in);
+		if (rc < 0)
+			goto out;
                 native_addr_len = sizeof(struct sockaddr_in);		
         }
 	else {
-		rc = -EINVAL;
+		/* Unsupported undelying protocol */
+		rc = -ENOTSUPP;
 		goto out;
 	}
 
@@ -369,8 +425,6 @@ static int __init af_sp_init(void)
 {
 	int rc;
 
-        printk(KERN_INFO "%s: Here\n", __func__);
-
 	rc = proto_register(&sp_proto, 1);
 	if (rc != 0) {
 		printk(KERN_CRIT "%s: Cannot create sp_sock SLAB cache!\n",
@@ -388,8 +442,6 @@ out:
  */
 static void __exit af_sp_exit(void)
 {
-       printk(KERN_INFO "%s: Here\n", __func__);
-
 	sock_unregister(PF_SP);
 	proto_unregister(&sp_proto);
 }
