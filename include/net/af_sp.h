@@ -8,46 +8,34 @@
 #define __LINUX_NET_AFSP_H
 
 #include <linux/socket.h>
+#include <linux/list.h>
 #include <linux/sp.h>
 #include <net/sock.h>
+#include <linux/workqueue.h>
 
 #ifdef __KERNEL__
 
-/* A single peer connection */
-struct sp_peer {
-	/* The peer socket */
+/* A single underlying socket */
+struct sp_usock {
+        /* Each SP socket has a list of usocks */
+        struct list_head list;
+        /* The SP socket owning this underlying socket */
+        struct sp_sock *owner;
+	/* The underlying socket itself */
 	struct socket *s;
-	/* Received message in progress */
-        unsigned char *recv_buf;
-	/* Received message size */
-	size_t recv_size;
-	/* Decoder state */
-        int recv_state;
+        /* Work performed on behalf of this socket */
+        struct work_struct work_in;
+        struct work_struct work_out;
 };
-
-#define RSTATE_MSGSTART 1
-#define RSTATE_MSGDATA 2
-#define RSTATE_MSGREADY 3
 
 /* The AF_SP socket private data */
 struct sp_sock {
         /* WARNING: sk has to be the first member */
-        struct sock	sk;
-	/* Pollset */
-	struct poll_wqueues pollset;
-        /* Socket synchronization mutex */
-        struct mutex sync_mutex;
-	/* Peer connection */
-	struct sp_peer *peer;
-	/* Listener socket, for bind */
-	struct socket *listener;
+        struct sock sk;
+        /* Lists of underlying sockets */
+        struct list_head listeners;
+        struct list_head connections;
 };
-
-/* Accessor for sp_sock from generic socket */
-#define sp_sk(__sk) ((struct sp_sock *)__sk)
-
-/* Accessor for sp_sock from peer struct sock */
-#define sp_parent(__p) ((struct sock *)__p)
 
 #endif
 

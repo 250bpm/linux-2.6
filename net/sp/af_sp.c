@@ -10,30 +10,31 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/socket.h>
+#include <linux/string.h>
 #include <linux/sp.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <net/af_sp.h>
 #include <linux/err.h>
-#include <linux/workqueue.h>
+#include <linux/in.h>
 
-static int sp_release(struct socket *);
 static int sp_create(struct net *, struct socket *, int, int);
-static void sp_sock_destructor(struct sock *);
+static void sp_destruct(struct sock *);
+static int sp_release(struct socket *sock);
 static int sp_connect(struct socket *, struct sockaddr *, int, int);
 static int sp_bind(struct socket *, struct sockaddr *, int);
-static int sp_pub_sendmsg(struct kiocb *, struct socket *, struct msghdr *,
-	size_t);
-static int sp_sub_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
+static int sp_sendmsg(struct kiocb *, struct socket *, struct msghdr *, size_t);
+static int sp_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
 	size_t, int);
-static void sp_bind_cb(struct sock *sk, int bytes);
-static void sp_newconn_task(struct work_struct *work);
+static void sp_in_cb(struct sock *sk, int bytes);
+static void sp_out_cb(struct sock *sk);
+static void sp_listener_work_in(struct work_struct *work);
 
 /* SP protocol information */
 static struct proto sp_proto = {
-	.name =		"SP",
-	.owner =	THIS_MODULE,
-	.obj_size =	sizeof(struct sp_sock),
+        .name =         "SP",
+        .owner =        THIS_MODULE,
+        .obj_size =     sizeof(struct sp_sock),
 };
 
 /* SP protocol family operations */
@@ -44,7 +45,7 @@ static const struct net_proto_family sp_family_ops = {
 };
 
 /* SP SOCK_PUB socket operations */
-static const struct proto_ops sp_pub_ops = {
+static const struct proto_ops sp_sock_ops = {
 	.family =	PF_SP,
 	.owner =	THIS_MODULE,
 	.release =	sp_release,
@@ -59,128 +60,121 @@ static const struct proto_ops sp_pub_ops = {
 	.shutdown =	sock_no_shutdown,
 	.setsockopt =	sock_no_setsockopt,
 	.getsockopt =	sock_no_getsockopt,
-	.sendmsg =	sp_pub_sendmsg,
-	.recvmsg =	sock_no_recvmsg,
+	.sendmsg =	sp_sendmsg,
+	.recvmsg =	sp_recvmsg,
 	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
 };
 
-/* SP SOCK_SUB socket operations */
-static const struct proto_ops sp_sub_ops = {
-	.family =	PF_SP,
-	.owner =	THIS_MODULE,
-	.release =	sp_release,
-	.bind =		sp_bind,
-	.connect =	sp_connect,
-	.socketpair =	sock_no_socketpair,
-	.accept =	sock_no_accept,
-	.getname =	sock_no_getname,
-	.poll =		sock_no_poll,
-	.ioctl =	sock_no_ioctl,
-	.listen =	sock_no_listen,
-	.shutdown =	sock_no_shutdown,
-	.setsockopt =	sock_no_setsockopt,
-	.getsockopt =	sock_no_getsockopt,
-	.sendmsg =	sock_no_sendmsg,
-	.recvmsg =	sp_sub_recvmsg,
-	.mmap =		sock_no_mmap,
-	.sendpage =	sock_no_sendpage,
-};
+static void sp_data_work_in(struct work_struct *work)
+{
+	printk(KERN_INFO "SP: In");
+}
 
-/* SP work item */
-struct sp_work_item {
-	struct work_struct work_item;
-	struct socket *s;
-};
+static void sp_data_work_out(struct work_struct *work)
+{
+	printk(KERN_INFO "SP: Out");
+}
 
 /*
- * sp_sock_destructor: SP socket destructor
+ * sp_register_usock: register new underlying socket with SP socket
+ */
+static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
+	struct list_head *list, void (*infunc)(struct work_struct*),
+	void (*outfunc)(struct work_struct*))
+{
+	/* Install callback to be called when a new connection arrives */
+	usock->s->sk->sk_user_data = (void *)usock;
+	INIT_WORK(&usock->work_in, infunc);
+	INIT_WORK(&usock->work_out, outfunc);
+	if (infunc)
+		usock->s->sk->sk_data_ready = sp_in_cb;
+	if (outfunc)
+		usock->s->sk->sk_write_space = sp_out_cb;
+
+	/* Add the new socket to the list of underlying sockets */
+        usock->owner = owner;
+	list_add(usock, list);
+}
+
+/*
+ * sp_newconn_task: Work handler to accept a new connection
+ */
+static void sp_listener_work_in(struct work_struct *work)
+{
+	struct sp_usock *listener = container_of(work,
+		struct sp_usock, work_in);
+        struct socket *new_sock;
+        struct sp_usock *new_usock;
+	int rc;
+
+	for(;;) {
+
+		/* Accept the new connection */
+		rc = kernel_accept(listener->s, &new_sock, 0);
+		if (rc == -EAGAIN)
+	      		break;
+		if (rc < 0) {
+			printk(KERN_INFO "%s: accept returned %d\n",
+				__func__, -rc);
+			return;
+		}
+
+
+		/* Allocate and initialise the underlying socket */
+		new_usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
+	        BUG_ON (!new_usock);
+		new_usock->s = new_sock;
+
+		/* Register the TCP socket with the SP socket */
+	        sp_register_usock (listener->owner, new_usock,
+			&listener->owner->connections,
+			sp_data_work_in, sp_data_work_out);
+
+		printk(KERN_INFO "SP: New underlying socket accepted");
+	}
+}
+
+/*
+ * sp_in_cb: A callback from underlying socket
  *
- * Called when an SP socket is freed.
+ * It executes the work associated with in incoming data.
  */
-static void sp_sock_destructor(struct sock *sk)
+static void sp_in_cb(struct sock *sk, int bytes)
 {
-	struct sp_sock *sp = sp_sk(sk);
-
-	printk(KERN_INFO "%s: Here\n", __func__);
-
-	/* Decrement protocol family refcount */
-	local_bh_disable();
-	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
-	local_bh_enable();
+        /* Add the work to global workqueue, if not already there */
+        struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
+	schedule_work(&usock->work_in);
 }
 
 /*
- * sp_release: Close an SP socket
+ * sp_out_cb: A callback from underlying socket
+ *
+ * It executes the work associated with in outgoing data.
  */
-static int sp_release(struct socket *sock)
+static void sp_out_cb(struct sock *sk)
 {
-	struct sock *sk = sock->sk;
-	struct sp_sock *sp = sp_sk(sk);
-
-	if (!sk)
-		return 0;
-
-	sock_hold(sk);
-
-	poll_freewait(&sp->pollset);
-	if (sp->peer) {
-		sock_release(sp->peer->s);
-		kfree(sp->peer);
-		sp->peer = NULL;
-	}
-
-	sock_orphan(sk);
-	sock_put(sk);
-
-	sock->sk = NULL;
-
-	return 0;
+        /* Add the work to global workqueue, if not already there */
+        struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
+	schedule_work(&usock->work_out);
 }
 
 /*
- * sp_create: Create an unconnected SP socket
+ * sp_sendmsg: Send a message to a socket
  */
-static int sp_create(struct net *net, struct socket *sock, int protocol,
-	int kern)
+static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
+	struct msghdr *msg, size_t len)
 {
-	struct sock *sk = NULL;
-	struct sp_sock *sp;
+    return -ENOTSUPP;
+}
 
-	if (protocol && protocol != PF_SP)
-		return -EPROTONOSUPPORT;
-
-	switch (sock->type) {
-	case SOCK_PUB:
-		sock->ops = &sp_pub_ops;
-		break;
-	case SOCK_SUB:
-		sock->ops = &sp_sub_ops;
-		break;
-	default:
-		return -ESOCKTNOSUPPORT;
-	}
-
-	/* Initial state is not connected */
-	sock->state = SS_UNCONNECTED;
-
-	/* Allocate SP private data */
-	sk = sk_alloc(net, PF_SP, GFP_KERNEL, &sp_proto);
-	if (!sk)
-		return -ENOMEM;
-	sock_init_data(sock, sk);
-	sk->sk_destruct	= sp_sock_destructor;
-	sp = sp_sk(sk);
-	sp->peer = NULL;
-	poll_initwait(&sp->pollset);
-        mutex_init(&sp->sync_mutex);
-
-	/* Increment procotol family refcount */
-	local_bh_disable();
-	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
-	local_bh_enable();
-
-	return 0;
+/*
+ * sp_recvmsg: Receive a message from a socket
+ */
+static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
+			  struct msghdr *msg, size_t size, int flags)
+{
+    return -ENOTSUPP;
 }
 
 /*
@@ -190,118 +184,81 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 	int addr_len)
 {
 	struct sock *sk = sock->sk;
-	struct sockaddr_in *addr_in;
-	struct sp_sock *sp = sp_sk(sk);
+	struct sp_sock *sp = (struct sp_sock *)sk;
+        struct sockaddr_sp *addr_sp;
+        struct sp_usock *listener;
+        struct sockaddr_storage native_addr;
+        int native_addr_len;
+        struct sockaddr_in *addr_in;
+        char *pos;
 	int rc;
 
-	/* Only a single peer supported for now */
-	if (sock->state != SS_UNCONNECTED) {
-		rc = -EISCONN;
-		goto out;
-	}
-	/* Only AF_INET addressing is supported for now */
-	if (addr->sa_family != AF_INET) {
+	/* Cast the address to proper SP address */
+	if (addr->sa_family != AF_SP) {
 		rc = -EAFNOSUPPORT;
 		goto out;
 	}
-	addr_in = (struct sockaddr_in *)addr;
+	addr_sp = (struct sockaddr_sp *)addr;
 
-	mutex_lock(&sp->sync_mutex);
+	printk(KERN_INFO "SP: Binding to %s", addr_sp->ssp_endpoint);
 
-	/* Create listener socket and associated file structure */
-	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->listener);
+	/* Parse the connection string */
+	/* TODO: check whether strchr doesn't exceed the address length */
+	pos = strchr (addr_sp->ssp_endpoint, ':');
+	if (pos == NULL) {
+		rc = -EINVAL;
+		goto out;
+	}
+	if (pos - addr_sp->ssp_endpoint == 3 &&
+		strncmp(addr_sp->ssp_endpoint, "tcp", 3) == 0) {
+
+		/* Let's just hard-wire the address for now */
+                addr_in = (struct sockaddr_in *)&native_addr;
+		addr_in->sin_family = AF_INET;
+		addr_in->sin_addr.s_addr = htonl(0x0a090175);
+		addr_in->sin_port = htons(5555);
+                native_addr_len = sizeof(struct sockaddr_in);		
+        }
+	else {
+		rc = -EINVAL;
+		goto out;
+	}
+
+        /* Allocate and initialise the underlying socket */
+        listener = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
+        if (!listener) {
+		rc = -ENOMEM;
+                goto out;
+        }
+	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &listener->s);
 	if (rc < 0)
-		goto out_unlock;
-	rc = sock_map_anon(sp->listener, "[sp]", 0);
-	if (rc < 0)
-		goto out_release;
-	printk(KERN_INFO "%s: socket = %p socket->sk->sk_socket = %p\n", __func__,
-		sp->listener, sp->listener->sk->sk_socket);
-	
-	/* Install callback to be called when a new connection arrives */
-	sp->listener->sk->sk_user_data = sk;
-	sp->listener->sk->sk_data_ready = sp_bind_cb;
+		goto out_dealloc;
+
+	/* Register the TCP listener socket with the SP socket */
+        sp_register_usock (sp, listener, &sp->listeners,
+		sp_listener_work_in, NULL);
 
 	/* Bind and listen for connections on listener socket */
-	rc = kernel_bind(sp->listener, addr, addr_len);
+	rc = kernel_bind(listener->s, (struct sockaddr *)&native_addr,
+		native_addr_len);
 	if (rc < 0)
 		goto out_release;
-	rc = kernel_listen(sp->listener, 1);
+
+	rc = kernel_listen(listener->s, 1);
 	if (rc < 0)
 		goto out_release;
 	
 	/* Socket is now bound, connections will be accepted asynchronously */
 	rc = 0;
-	goto out_unlock;
+	goto out;
 
 out_release:
-	sock_release(sp->listener);
-	sp->listener = NULL;
-out_unlock:
-	mutex_unlock(&sp->sync_mutex);
+	sock_release(listener->s);
+        list_del(&listener->list);
+out_dealloc:
+        kfree(listener);
 out:
 	return rc;
-}
-
-/*
- * sp_bind_cb: Callback called from sp->listener->sk_data_ready
- */
-static void sp_bind_cb(struct sock *sk, int bytes)
-{
-	/* All we do here is schedule a work item to accept the connection */
-	struct sp_work_item *sp_work;
-
-	printk(KERN_INFO "%s: Here\n", __func__);
-
-	sp_work = kmalloc(sizeof (struct sp_work_item), GFP_KERNEL);
-	if (!sp_work)
-		return;
-	INIT_WORK(&sp_work->work_item, sp_newconn_task);
-	sp_work->s = sk->sk_socket;
-	sk->sk_data_ready = NULL;
-	schedule_work(&sp_work->work_item);
-}
-
-/*
- * sp_newconn_task: Work handler to accept a new connection
- */
-static void sp_newconn_task(struct work_struct *work)
-{
-	struct sp_work_item *sp_work = container_of(work, struct sp_work_item, work_item);
-	struct socket *listener = sp_work->s;
-	struct socket *peer;
-	struct sock *sk = (struct sock *)sp_work->s->sk->sk_user_data;
-	struct sp_sock *sp = sp_sk(sk);
-	struct sp_peer *sp_peer;
-	int rc;
-
-	printk(KERN_INFO "%s: Here\n", __func__);
-	return;
-
-	/* Accept the new connection */
-	rc = kernel_accept(listener, &peer, 0);
-	if (rc < 0) {
-		printk(KERN_INFO "%s: accept returned %d\n", __func__, -rc);
-		return;
-	}
-       
-	/* Allocate space for peer connection */
-	sp_peer = kmalloc(sizeof (struct sp_peer), GFP_KERNEL);
-        if (!sp_peer) {
-		sock_release(peer);
-		return;
-	}
-
-	/* Peer socket is now ready, link it to parent SP socket */
-	mutex_lock(&sp->sync_mutex);
-	sp->peer->s = peer;
-	sp->peer->recv_state = RSTATE_MSGSTART;
-	sp->peer->recv_buf = NULL;
-	sp->peer->recv_size = 0;
-	sk->sk_socket->state = SS_CONNECTED;
-	mutex_unlock(&sp->sync_mutex);
-
-	return;
 }
 
 /*
@@ -310,207 +267,99 @@ static void sp_newconn_task(struct work_struct *work)
 static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	int addr_len, int flags)
 {
-	struct sock *sk = sock->sk;
-	struct sockaddr_in *addr_in;
-	struct sp_sock *sp = sp_sk(sk);
-	int rc;
-
-	/* Only a single peer supported for now */
-	if (sock->state != SS_UNCONNECTED) {
-		rc = -EISCONN;
-		goto out;
-	}
-	/* Only AF_INET addressing is supported for now */
-	if (addr->sa_family != AF_INET) {
-		rc = -EAFNOSUPPORT;
-		goto out;
-	}
-	addr_in = (struct sockaddr_in *)addr;
-
-	mutex_lock(&sp->sync_mutex);
-
-	/* Create peer socket and associated file structure */
-        sp->peer = kmalloc(sizeof (struct sp_peer), GFP_KERNEL);
-        if (!sp->peer) {
-		rc = -ENOMEM;
-		goto out;
-	}
-	sp->peer->recv_state = RSTATE_MSGSTART;
-	sp->peer->recv_buf = NULL;
-	sp->peer->recv_size = 0;
-
-	rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sp->peer->s);
-	if (rc < 0)
-		goto out_unlock;
-	rc = sock_map_anon(sp->peer->s, "[sp]", 0);
-	/* rc = sock_map_fd(sp->peer->s, O_CLOEXEC); */
-	if (rc < 0)
-		goto out_release;
-
-	/* Connect peer socket */
-	rc = kernel_connect(sp->peer->s, addr, addr_len, 0);
-	if (rc < 0)
-		goto out_release;
-	
-	/* Socket is now connected */
-	sock->state = SS_CONNECTED;
-	rc = 0;
-	goto out_unlock;
-
-out_release:
-	sock_release(sp->peer->s);
-	sp->peer = NULL;
-out_unlock:
-	mutex_unlock(&sp->sync_mutex);
-out:
-	return rc;
+	return -ENOTSUPP;
 }
 
 /*
- * sp_pub_sendmsg: Send a message to a SOCK_PUB socket
+ * sp_release: Close an SP socket
  */
-static int sp_pub_sendmsg(struct kiocb *kiocb, struct socket *sock,
-	struct msghdr *msg, size_t len)
+static int sp_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
-	struct sp_sock *sp = sp_sk(sk);
-	int revents, rc;
-	struct msghdr hdr;
-	struct kvec vec;
-	int nbytes;
-	unsigned char send_size;
-	unsigned char *send_buf;
+        struct sp_sock *sp = (struct sp_sock *)sk;
+        struct sp_usock *it, *next;
 
-	if (sock->state != SS_CONNECTED)
-		return -ENOTCONN;
-	if (len > 255)
-		return -EMSGSIZE;
+	if (!sk)
+		return 0;
 
-	mutex_lock(&sp->sync_mutex);
-
-	/* Poll for send space on peer socket */
-	while (1) {
-		revents = sp->peer->s->file->f_op->poll(
-			sp->peer->s->file,
-			&sp->pollset.pt);
-		if (revents & POLLOUT)
-			break;
-		if (signal_pending(current)) {
-			rc = -EINTR;
-			goto out;
-		}
-		poll_schedule(&sp->pollset, TASK_INTERRUPTIBLE);
+        /* First, destroy all the underlying listeners */
+	list_for_each_entry_safe(it, next, &sp->listeners, list) {
+		sock_release(it->s);
+		list_del(&it->list);
+		kfree(it);
+		printk(KERN_INFO "SP: Underlying listener deallocated\n");
 	}
 
-	/* Allocate buffer space for message to send and copy from user */
-	send_size = (unsigned char)len;
-	send_buf = kmalloc(send_size, GFP_KERNEL);
-	if (!send_buf) {
-		rc = -ENOMEM;
-		goto out;
+        /* First, destroy all the underlying connections */
+	list_for_each_entry_safe(it, next, &sp->connections, list) {
+		sock_release(it->s);
+		list_del(&it->list);
+		kfree(it);
+		printk(KERN_INFO "SP: Underlying connection deallocated\n");
 	}
-	rc = memcpy_fromiovecend(send_buf, msg->msg_iov, 0, send_size);
-	if (rc < 0)
-		goto out_free;
 
-	/* Send message size */
-	printk(KERN_INFO "%s: before send data\n", __func__);
-	memset (&hdr, 0, sizeof hdr);
-	vec.iov_base = &send_size;
-	vec.iov_len = 1;
-	nbytes = kernel_sendmsg(sp->peer->s, &hdr, &vec, 1, 1);
-	printk(KERN_INFO "%s: after send data\n", __func__);
-	BUG_ON(nbytes != 1);
+        /* Detach socket from process context. */
+	sock_hold(sk);
+	sock_orphan(sk);
+	sock_put(sk);
 
-	/* Send message data */
-	memset (&hdr, 0, sizeof hdr);
-	vec.iov_base = send_buf;
-	vec.iov_len = send_size;
-	nbytes = kernel_sendmsg(sp->peer->s, &hdr, &vec, 1, send_size);
-	BUG_ON(nbytes < send_size);
+	sock->sk = NULL;
 
-	rc = send_size;
-out_free:
-	kfree(send_buf);
-out:
-	mutex_unlock(&sp->sync_mutex);
-	return rc;
+	printk(KERN_INFO "SP: Socket destroyed");
+
+	return 0;
 }
 
 /*
- * sp_sub_recvmsg: Receive a message from a SOCK_SUB socket
+ * sp_destruct: SP socket destructor
+ *
+ * Called when an SP socket is freed.
  */
-static int sp_sub_recvmsg(struct kiocb *iocb, struct socket *sock,
-			  struct msghdr *msg, size_t size, int flags)
+static void sp_destruct(struct sock *sk)
 {
-	struct sock *sk = sock->sk;
-	struct sp_sock *sp = sp_sk(sk);
-	int revents, rc;
-	struct msghdr hdr;
-	struct kvec vec;
-	int nbytes;
+	/* Decrement protocol family refcount */
+	local_bh_disable();
+	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
+	local_bh_enable();
+}
 
-	if (sock->state != SS_CONNECTED)
-		return -ENOTCONN;
+/*
+ * sp_create: Create an unconnected SP socket
+ */
+static int sp_create(struct net *net, struct socket *sock, int protocol,
+	int kern)
+{
+	struct sock *sk;
+        struct sp_sock *sp;
 
-	mutex_lock(&sp->sync_mutex);
+	if (protocol && protocol != PF_SP)
+		return -EPROTONOSUPPORT;
 
-	if (sp->peer->recv_state == RSTATE_MSGSTART) {
-		/* Poll for incoming data on peer socket */
-		while (1) {
-			revents = sp->peer->s->file->f_op->poll(
-				sp->peer->s->file,
-				&sp->pollset.pt);
-			if (revents & POLLIN)
-				break;
-			if (signal_pending(current)) {
-				rc = -EINTR;
-				goto out;
-			}
-			poll_schedule(&sp->pollset, TASK_INTERRUPTIBLE);
-		}
-	
-		/* Receive message size */
-		memset (&hdr, 0, sizeof hdr);
-		vec.iov_base = &sp->peer->recv_size;
-		vec.iov_len = 1;
-		nbytes = kernel_recvmsg(sp->peer->s, &hdr, &vec, 1, 1,
-			MSG_DONTWAIT);
-		BUG_ON(nbytes != 1);
-		sp->peer->recv_state = RSTATE_MSGDATA;
+        /* Set up the table of virtual functions for the socket */
+        sock->ops = &sp_sock_ops;
 
-		/* Receive message data */
-		memset (&hdr, 0, sizeof hdr);
-		sp->peer->recv_buf = kmalloc(sp->peer->recv_size, GFP_KERNEL);
-		if (!sp->peer->recv_buf) {
-			rc = -ENOMEM;
-			goto out;
-		}
-		vec.iov_base = sp->peer->recv_buf;
-		vec.iov_len = sp->peer->recv_size;
-		/* Destructively modifies vec! */
-		nbytes = kernel_recvmsg(sp->peer->s, &hdr, &vec, 1,
-			sp->peer->recv_size, 0);
-		
-		sp->peer->recv_state = RSTATE_MSGREADY;
-	}
+       	/* Allocate private data */
+	sk = sk_alloc(net, PF_SP, GFP_KERNEL, &sp_proto);
+	if (!sk)
+		return -ENOMEM;
 
-	if (size < sp->peer->recv_size) {
-		rc = -EMSGSIZE;
-		goto out;
-	}
-	rc = memcpy_toiovec(msg->msg_iov, sp->peer->recv_buf,
-		sp->peer->recv_size);
-	if (rc < 0)
-		goto out;
+	/* Initialise the underlying socket */
+	sock_init_data(sock, sk);
+	sk->sk_destruct	= sp_destruct;
 
-	kfree(sp->peer->recv_buf);
-	sp->peer->recv_state = RSTATE_MSGSTART;
-	rc = sp->peer->recv_size;
+	/* Initialise the SP socket itself */
+	sp = (struct sp_sock *)sk;
+	INIT_LIST_HEAD(&sp->listeners);
+	INIT_LIST_HEAD(&sp->connections);
 
-out:
-	mutex_unlock(&sp->sync_mutex);
-	return rc;
+	/* Increment procotol family refcount */
+	local_bh_disable();
+	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
+	local_bh_enable();
+
+	printk(KERN_INFO "SP: Socket created");
+
+	return 0;
 }
 
 /*
@@ -518,7 +367,9 @@ out:
  */
 static int __init af_sp_init(void)
 {
-	int rc = -1;
+	int rc;
+
+        printk(KERN_INFO "%s: Here\n", __func__);
 
 	rc = proto_register(&sp_proto, 1);
 	if (rc != 0) {
@@ -537,6 +388,8 @@ out:
  */
 static void __exit af_sp_exit(void)
 {
+       printk(KERN_INFO "%s: Here\n", __func__);
+
 	sock_unregister(PF_SP);
 	proto_unregister(&sp_proto);
 }
