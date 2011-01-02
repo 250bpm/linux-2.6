@@ -379,8 +379,8 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 
 		/* Start connecting to the peer */
 		rc = kernel_connect(usock->s, (struct sockaddr *)&uaddr,
-			uaddr_len, 0);
-		if (rc < 0)
+			uaddr_len, O_NONBLOCK);
+		if (rc < 0 && rc != -EINPROGRESS)
 			goto out_release;
 	}
 	else {
