@@ -320,7 +320,49 @@ static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 			  struct msghdr *msg, size_t size, int flags)
 {
-    return -ENOTSUPP;
+	struct sp_usock *usock;
+	int rc = 0;
+	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
+
+	mutex_lock(&sp->sync);
+
+	list_for_each_entry(usock, &sp->connections, list) {
+		if(usock->inmsg_data && usock->inmsg_pos == usock->inmsg_size) {
+
+			/* Check whether messsage fits into supplied buffer */
+			if (size < usock->inmsg_size) {
+				rc = -EMSGSIZE;
+				goto out_unlock;
+			}
+
+			/* Copy the message data to supplied buffer */
+			rc = memcpy_toiovec(msg->msg_iov, usock->inmsg_data,
+				usock->inmsg_size);
+			if (rc < 0)
+				goto out_unlock;
+
+			/* Return number of bytes read */
+			rc = usock->inmsg_size;
+
+			kfree(usock->inmsg_data);
+
+			usock->inmsg_data = NULL;
+			usock->inmsg_size = 0;
+			usock->inmsg_pos = 0;
+
+			/* Start reading new message */
+			sp_in_cb (usock->s->sk, 0);
+
+			goto out_unlock;
+		}
+	}
+
+	/* No message is available */
+	rc = -EAGAIN;
+
+out_unlock:
+	mutex_unlock(&sp->sync);
+	return rc;
 }
 
 /*
