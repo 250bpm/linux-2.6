@@ -210,7 +210,31 @@ out:
 
 static void sp_data_work_out(struct work_struct *work)
 {
-	printk(KERN_INFO "SP: Out");
+	struct sp_usock *usock = container_of(work,
+		struct sp_usock, work_out);
+	struct kvec vec;
+	struct msghdr hdr;
+	int nbytes;
+
+	mutex_lock(&usock->owner->sync);
+
+	/* Try to send the remaining part of the message */
+	memset (&hdr, 0, sizeof hdr);
+	vec.iov_base = (char *)usock->outmsg_data + usock->outmsg_pos;
+	vec.iov_len = usock->outmsg_size - usock->outmsg_pos;
+	nbytes = kernel_sendmsg(usock->s, &hdr, &vec, 1, vec.iov_len);
+	BUG_ON(nbytes < 0);
+	usock->outmsg_pos += nbytes;
+
+	/*  If the message is fully sent, clean the buffer */
+	if (usock->outmsg_data && usock->outmsg_pos == usock->outmsg_size) {
+		kfree(usock->outmsg_data);
+		usock->outmsg_data = NULL;
+		usock->outmsg_size = 0;
+		usock->outmsg_pos = 0;
+	}
+
+	mutex_unlock(&usock->owner->sync);
 }
 
 /*
@@ -224,6 +248,9 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	usock->inmsg_data = NULL;
 	usock->inmsg_size = 0;
 	usock->inmsg_pos = 0;
+	usock->outmsg_data = NULL;
+	usock->outmsg_size = 0;
+	usock->outmsg_pos = 0;
 
 	/* Install callback to be called when a new connection arrives */
 	usock->s->sk->sk_user_data = (void *)usock;
@@ -311,14 +338,54 @@ static void sp_out_cb(struct sock *sk)
 static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	struct msghdr *msg, size_t len)
 {
-    return -ENOTSUPP;
+	struct sp_usock *usock;
+	int rc = 0;
+	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
+
+	/* At the moment, the size is stored as a single byte */
+	if (len > 0xff)
+		return -EMSGSIZE;
+
+	mutex_lock(&sp->sync);
+
+	list_for_each_entry(usock, &sp->connections, list) {
+		if(!usock->outmsg_data) {
+
+			usock->outmsg_data = kmalloc(len + 1, GFP_KERNEL);
+			if (!usock->outmsg_data) {
+				rc = -ENOMEM;
+				goto out_unlock;
+			}
+			*((unsigned char*)usock->outmsg_data) = len;
+			rc = memcpy_fromiovec((char *)usock->outmsg_data + 1,
+				msg->msg_iov, len);
+			if (rc < 0)
+				goto out_unlock;
+			usock->outmsg_size = len;
+			usock->outmsg_pos = 0;
+
+			/* Start sending the message */
+			sp_out_cb(usock->s->sk);
+
+			/* All the bytes are sent */
+			rc = len;
+			goto out_unlock;
+		}
+	}
+
+	/* No connection is available for writing */
+	rc = -EAGAIN;
+
+out_unlock:
+	mutex_unlock(&sp->sync);
+	return rc;
 }
 
 /*
  * sp_recvmsg: Receive a message from a socket
  */
 static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
-			  struct msghdr *msg, size_t size, int flags)
+	struct msghdr *msg, size_t size, int flags)
 {
 	struct sp_usock *usock;
 	int rc = 0;

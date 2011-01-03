@@ -30,6 +30,10 @@ struct sp_usock {
         void *inmsg_data;
         int inmsg_size;
         int inmsg_pos;
+	/* The outbound message being sent at the moment */
+        void *outmsg_data;
+        int outmsg_size;
+        int outmsg_pos;
 };
 
 /* The AF_SP socket private data */
