@@ -17,6 +17,7 @@
 #include <net/af_sp.h>
 #include <linux/err.h>
 #include <linux/in.h>
+#include <net/tcp_states.h>
 
 /* Underlying protocol constants */
 #define SP_PROTOCOL_TCP 1
@@ -68,6 +69,21 @@ static const struct proto_ops sp_sock_ops = {
 	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
 };
+
+/*
+ * sp_uscok_destroy: clean up the underlying socket
+ */
+static void sp_usock_destroy (struct sp_usock *usock)
+{
+	struct sp_sock *owner = usock->owner;
+	mutex_lock(&owner->sync);
+	sock_release(usock->s);
+	list_del(&usock->list);
+	if (usock->inmsg_data)
+		kfree (usock->inmsg_data);
+	kfree(usock);
+	mutex_unlock(&owner->sync);
+}
 
 /*
  * sp_parse_address: convert textual address into corresponding structure
@@ -152,7 +168,7 @@ static void sp_data_work_in(struct work_struct *work)
 	unsigned char size;
 	int nbytes;
 
-	printk(KERN_INFO "SP: In");
+	mutex_lock(&usock->owner->sync);
 
 	/*  If there's no message, read the size and allocate the buffer */
 	if (usock->inmsg_data == NULL) {
@@ -174,7 +190,7 @@ static void sp_data_work_in(struct work_struct *work)
 
 	/*  If the message is fully read there's nothing more to do */
 	if (usock->inmsg_pos == usock->inmsg_size)
-		return;
+		goto out;
 
 	/* Try to read the remaining part of the message */
 	memset (&hdr, 0, sizeof hdr);
@@ -187,6 +203,9 @@ static void sp_data_work_in(struct work_struct *work)
 	if (usock->inmsg_pos == usock->inmsg_size)
 			printk(KERN_INFO "SP: Message fully read (%d bytes)",
 				(int)usock->inmsg_size);
+
+out:
+	mutex_unlock(&usock->owner->sync);
 }
 
 static void sp_data_work_out(struct work_struct *work)
@@ -217,7 +236,9 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 
 	/* Add the new socket to the list of underlying sockets */
         usock->owner = owner;
+	mutex_lock (&owner->sync);
 	list_add(&usock->list, list);
+	mutex_unlock (&owner->sync);
 }
 
 /*
@@ -268,6 +289,8 @@ static void sp_in_cb(struct sock *sk, int bytes)
         /* Add the work to global workqueue, if not already there */
         struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 	schedule_work(&usock->work_in);
+
+	printk(KERN_INFO "SP: in_cb bytes=%d", (int) bytes);
 }
 
 /*
@@ -462,17 +485,13 @@ static int sp_release(struct socket *sock)
 
         /* First, destroy all the underlying listeners */
 	list_for_each_entry_safe(it, next, &sp->listeners, list) {
-		sock_release(it->s);
-		list_del(&it->list);
-		kfree(it);
+		sp_usock_destroy (it);
 		printk(KERN_INFO "SP: Underlying listener deallocated\n");
 	}
 
         /* First, destroy all the underlying connections */
 	list_for_each_entry_safe(it, next, &sp->connections, list) {
-		sock_release(it->s);
-		list_del(&it->list);
-		kfree(it);
+		sp_usock_destroy (it);
 		printk(KERN_INFO "SP: Underlying connection deallocated\n");
 	}
 
@@ -529,6 +548,7 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	sp = (struct sp_sock *)sk;
 	INIT_LIST_HEAD(&sp->listeners);
 	INIT_LIST_HEAD(&sp->connections);
+	mutex_init(&sp->sync);
 
 	/* Increment procotol family refcount */
 	local_bh_disable();

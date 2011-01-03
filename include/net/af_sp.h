@@ -39,6 +39,8 @@ struct sp_sock {
         /* Lists of underlying sockets */
         struct list_head listeners;
         struct list_head connections;
+	/* Mutex to synchronise user-space threads with kernel workqueues */
+	struct mutex sync;
 };
 
 #endif
