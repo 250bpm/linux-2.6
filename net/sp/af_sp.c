@@ -200,9 +200,14 @@ static void sp_data_work_in(struct work_struct *work)
 		MSG_DONTWAIT);
 	BUG_ON(nbytes < 0);
 	usock->inmsg_pos += nbytes;
-	if (usock->inmsg_pos == usock->inmsg_size)
-			printk(KERN_INFO "SP: Message fully read (%d bytes)",
-				(int)usock->inmsg_size);
+	if (usock->inmsg_pos == usock->inmsg_size) {
+		printk(KERN_INFO "SP: Message fully read (%d bytes)",
+			(int)usock->inmsg_size);
+		if(usock->owner->recv_waiting) {
+			usock->owner->recv_waiting = 0;
+			complete(&usock->owner->recv_wait);
+		}
+	}
 
 out:
 	mutex_unlock(&usock->owner->sync);
@@ -232,6 +237,11 @@ static void sp_data_work_out(struct work_struct *work)
 		usock->outmsg_data = NULL;
 		usock->outmsg_size = 0;
 		usock->outmsg_pos = 0;
+
+		if(usock->owner->send_waiting) {
+			usock->owner->send_waiting = 0;
+			complete(&usock->owner->send_wait);
+		}
 	}
 
 	mutex_unlock(&usock->owner->sync);
@@ -266,10 +276,14 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	mutex_lock (&owner->sync);
 	list_add(&usock->list, list);
 	mutex_unlock (&owner->sync);
+
+	/* It may be possible to read or write to the socket */
+	sp_in_cb (usock->s->sk, 0);
+	sp_out_cb (usock->s->sk);
 }
 
 /*
- * sp_newconn_task: Work handler to accept a new connection
+ * sp_liatener_work_in: Work handler to accept a new connection
  */
 static void sp_listener_work_in(struct work_struct *work)
 {
@@ -342,12 +356,15 @@ static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	int rc = 0;
 	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
 
+printk(KERN_INFO "SP: send flags=%d", (int) msg->msg_flags);
+
 	/* At the moment, the size is stored as a single byte */
 	if (len > 0xff)
 		return -EMSGSIZE;
 
 	mutex_lock(&sp->sync);
 
+loop:
 	list_for_each_entry(usock, &sp->connections, list) {
 		if(!usock->outmsg_data) {
 
@@ -373,8 +390,23 @@ static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 		}
 	}
 
-	/* No connection is available for writing */
-	rc = -EAGAIN;
+	/* Nowhere to send the message and we are in the non-blocking mode */
+	if (msg->msg_flags & MSG_DONTWAIT) {
+		rc = -EAGAIN;
+		goto out_unlock;
+	}
+
+	/* Wait till we can send */
+	if (sp->send_waiting != 1) {
+		sp->send_waiting = 1;
+		init_completion(&sp->send_wait);
+	}
+	mutex_unlock(&sp->sync);
+	rc = wait_for_completion_interruptible(&sp->send_wait);
+	if (rc < 0)
+		goto out_unlock;
+	mutex_lock(&sp->sync);
+	goto loop;
 
 out_unlock:
 	mutex_unlock(&sp->sync);
@@ -393,6 +425,7 @@ static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 
 	mutex_lock(&sp->sync);
 
+loop:
 	list_for_each_entry(usock, &sp->connections, list) {
 		if(usock->inmsg_data && usock->inmsg_pos == usock->inmsg_size) {
 
@@ -424,8 +457,23 @@ static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 		}
 	}
 
-	/* No message is available */
-	rc = -EAGAIN;
+	/* There are no message and we are in the non-blocking mode */
+	if (flags & MSG_DONTWAIT) {
+		rc = -EAGAIN;
+		goto out_unlock;
+	}
+
+	/* Wait till message arrives */
+	if (sp->recv_waiting != 1) {
+		sp->recv_waiting = 1;
+		init_completion(&sp->recv_wait);
+	}
+	mutex_unlock(&sp->sync);
+	rc = wait_for_completion_interruptible(&sp->recv_wait);
+	if (rc < 0)
+		goto out_unlock;
+	mutex_lock(&sp->sync);
+	goto loop;
 
 out_unlock:
 	mutex_unlock(&sp->sync);
@@ -658,6 +706,8 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	INIT_LIST_HEAD(&sp->listeners);
 	INIT_LIST_HEAD(&sp->connections);
 	mutex_init(&sp->sync);
+	sp->recv_waiting = 0;
+	sp->send_waiting = 0;
 
 	/* Increment procotol family refcount */
 	local_bh_disable();

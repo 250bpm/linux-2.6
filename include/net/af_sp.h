@@ -12,6 +12,7 @@
 #include <linux/sp.h>
 #include <net/sock.h>
 #include <linux/workqueue.h>
+#include <linux/completion.h>
 
 #ifdef __KERNEL__
 
@@ -45,6 +46,14 @@ struct sp_sock {
         struct list_head connections;
 	/* Mutex to synchronise user-space threads with kernel workqueues */
 	struct mutex sync;
+	/* Completion to wait on in send calls */
+	struct completion send_wait;
+	/* If 1 user thread is being blocked on send */
+	int send_waiting;
+	/* Completion to wait on in recv calls */
+	struct completion recv_wait;
+	/* If 1 user thread is being blocked on recv */
+	int recv_waiting;
 };
 
 #endif
