@@ -276,14 +276,10 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	mutex_lock (&owner->sync);
 	list_add(&usock->list, list);
 	mutex_unlock (&owner->sync);
-
-	/* It may be possible to read or write to the socket */
-	sp_in_cb (usock->s->sk, 0);
-	sp_out_cb (usock->s->sk);
 }
 
 /*
- * sp_liatener_work_in: Work handler to accept a new connection
+ * sp_listener_work_in: Work handler to accept a new connection
  */
 static void sp_listener_work_in(struct work_struct *work)
 {
