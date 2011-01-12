@@ -8,7 +8,6 @@ static inline u64 sp_read_u64 (u8 *buff);
 static void sp_decoder_alloc_message(struct sp_decoder *dcdr, int size);
 
 /* State machine actions */
-static void sp_decoder_idle(struct sp_decoder *dcdr);
 static void sp_decoder_one_byte_size_ready(struct sp_decoder *dcdr);
 static void sp_decoder_eight_byte_size_ready(struct sp_decoder *dcdr);
 static void sp_decoder_flags_ready(struct sp_decoder *dcdr);
@@ -37,12 +36,14 @@ void sp_decoder_init(struct sp_decoder *dcdr,
 	int (*read)(struct sp_decoder*, void*, int))
 {
 	dcdr->read = read;
-	dcdr->next = sp_decoder_idle;
-	dcdr->read_pos = NULL;
-	dcdr->read_size = 0;
 	dcdr->msg_data = NULL;
 	dcdr->msg_size = 0;
 	dcdr->msg_ready = 0;
+
+	/* Set up the first step of the state machine */
+	dcdr->read_pos = dcdr->buff;
+	dcdr->read_size = 1;
+	dcdr->next = sp_decoder_one_byte_size_ready;
 }
 
 /*
@@ -59,7 +60,22 @@ int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
 {
 	int n;
 
+	printk(KERN_INFO "SP: %s", __func__);
+
 	while(1) {
+
+		/* Try to read as much data as required by the state machine */
+		n = dcdr->read(dcdr, dcdr->read_pos, dcdr->read_size);
+printk(KERN_INFO "SP: reading %d read %d", (int) dcdr->read_size, (int) n);
+		dcdr->read_pos += n;
+		dcdr->read_size -= n;
+
+		/* If not all data requested was read we have to wait */
+		if (dcdr->read_size)
+			return -EAGAIN;
+
+		/* Invoke the state machine */
+		dcdr->next(dcdr);
 
 		/* If there is a message available return it */
 		if(dcdr->msg_ready) {
@@ -69,24 +85,12 @@ int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
 
 			*data = dcdr->msg_data;
 			*size = dcdr->msg_size;
-			dcdr->msg_data = NULL;
-			dcdr->msg_size = 0;
-			dcdr->msg_ready = 0;
+
+			/* Re-initialise the decoder to read the next message */
+			sp_decoder_init(dcdr, dcdr->read);
+
 			return 0;
 		}
-
-		/* If there is no more data to read invoke the state machine */
-		if(dcdr->read_size == 0)
-			dcdr->next(dcdr);
-
-		/* Try to read as much data as required by the state machine */
-		n = dcdr->read(dcdr, dcdr->read_pos, dcdr->read_size);
-		dcdr->read_pos += n;
-		dcdr->read_size -= n;
-
-		/* If not all data requested was read we have to wait */
-		if (dcdr->read_size)
-			return -EAGAIN;
 	}
 }
 
@@ -95,20 +99,14 @@ int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
  */
 static void sp_decoder_alloc_message(struct sp_decoder *dcdr, int size)
 {
-	dcdr->msg_data = kmalloc(size, GFP_KERNEL);
+	BUG_ON(size < 1);
+	dcdr->msg_data = kmalloc(size - 1, GFP_KERNEL);
 	BUG_ON(!dcdr->msg_data);
-	dcdr->msg_size = size;
+	dcdr->msg_size = size - 1;
 
 	dcdr->read_pos = dcdr->buff;
 	dcdr->read_size = 1;
 	dcdr->next = sp_decoder_flags_ready;
-}
-
-static void sp_decoder_idle(struct sp_decoder *dcdr)
-{
-	dcdr->read_pos = dcdr->buff;
-	dcdr->read_size = 1;
-	dcdr->next = sp_decoder_one_byte_size_ready;
 }
 
 static void sp_decoder_one_byte_size_ready(struct sp_decoder *dcdr)
@@ -142,8 +140,4 @@ static void sp_decoder_flags_ready(struct sp_decoder *dcdr)
 static void sp_decoder_data_ready(struct sp_decoder *dcdr)
 {
 	dcdr->msg_ready = 1;
-
-	dcdr->read_pos = NULL;
-	dcdr->read_size = 0;
-	dcdr->next = sp_decoder_idle;
 }

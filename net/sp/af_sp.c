@@ -71,6 +71,26 @@ static const struct proto_ops sp_sock_ops = {
 };
 
 /*
+ * sp_usock_read: this function is used by decoder to read more data from
+                  the underlying socket
+ */
+int sp_usock_read(struct sp_decoder *dcdr, void *data, int size)
+{
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	struct kvec vec;
+	struct msghdr hdr;
+	int nbytes;
+
+	memset (&hdr, 0, sizeof hdr);
+	vec.iov_base = (char *)data;
+	vec.iov_len = size;
+	nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, vec.iov_len,
+		MSG_DONTWAIT);
+	BUG_ON(nbytes < 0);
+	return nbytes;
+}
+
+/*
  * sp_uscok_destroy: clean up the underlying socket
  */
 static void sp_usock_destroy (struct sp_usock *usock)
@@ -79,8 +99,7 @@ static void sp_usock_destroy (struct sp_usock *usock)
 	mutex_lock(&owner->sync);
 	sock_release(usock->s);
 	list_del(&usock->list);
-	if (usock->inmsg_data)
-		kfree (usock->inmsg_data);
+	sp_decoder_destroy(&usock->decoder);
 	kfree(usock);
 	mutex_unlock(&owner->sync);
 }
@@ -163,53 +182,13 @@ static void sp_data_work_in(struct work_struct *work)
 {
 	struct sp_usock *usock = container_of(work,
 		struct sp_usock, work_in);
-	struct kvec vec;
-	struct msghdr hdr;
-	unsigned char size;
-	int nbytes;
 
+	/* If a user thread is waiting for a message, unblock it */
 	mutex_lock(&usock->owner->sync);
-
-	/*  If there's no message, read the size and allocate the buffer */
-	if (usock->inmsg_data == NULL) {
-		memset (&hdr, 0, sizeof hdr);
-		vec.iov_base = &size;
-		vec.iov_len = 1;
-		nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, 1,
-			MSG_DONTWAIT);
-		if (nbytes == 0)
-			return;
-		BUG_ON (nbytes != 1);
-
-		usock->inmsg_data = kmalloc(size, GFP_KERNEL);
-	        BUG_ON (!usock->inmsg_data);
-		usock->inmsg_size = size;
-		usock->inmsg_pos = 0;
-		printk(KERN_INFO "SP: Size %d received", (int) size);
-        }
-
-	/*  If the message is fully read there's nothing more to do */
-	if (usock->inmsg_pos == usock->inmsg_size)
-		goto out;
-
-	/* Try to read the remaining part of the message */
-	memset (&hdr, 0, sizeof hdr);
-	vec.iov_base = (char *)usock->inmsg_data + usock->inmsg_pos;
-	vec.iov_len = usock->inmsg_size - usock->inmsg_pos;
-	nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, vec.iov_len,
-		MSG_DONTWAIT);
-	BUG_ON(nbytes < 0);
-	usock->inmsg_pos += nbytes;
-	if (usock->inmsg_pos == usock->inmsg_size) {
-		printk(KERN_INFO "SP: Message fully read (%d bytes)",
-			(int)usock->inmsg_size);
-		if(usock->owner->recv_waiting) {
-			usock->owner->recv_waiting = 0;
-			complete(&usock->owner->recv_wait);
-		}
+	if(usock->owner->recv_waiting) {
+		usock->owner->recv_waiting = 0;
+		complete(&usock->owner->recv_wait);
 	}
-
-out:
 	mutex_unlock(&usock->owner->sync);
 }
 
@@ -255,9 +234,7 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	void (*outfunc)(struct work_struct*))
 {
 	/* Basic initialisation */
-	usock->inmsg_data = NULL;
-	usock->inmsg_size = 0;
-	usock->inmsg_pos = 0;
+	sp_decoder_init(&usock->decoder, sp_usock_read);
 	usock->outmsg_data = NULL;
 	usock->outmsg_size = 0;
 	usock->outmsg_pos = 0;
@@ -415,42 +392,34 @@ out_unlock:
 static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 	struct msghdr *msg, size_t size, int flags)
 {
-	struct sp_usock *usock;
-	int rc = 0;
 	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
+	struct sp_usock *usock;
+	int rc;
+	void *msg_data;
+	int msg_size;
 
 	mutex_lock(&sp->sync);
 
 loop:
+	/* Loop over all the underlying sockets */
 	list_for_each_entry(usock, &sp->connections, list) {
-		if(usock->inmsg_data && usock->inmsg_pos == usock->inmsg_size) {
 
-			/* Check whether messsage fits into supplied buffer */
-			if (size < usock->inmsg_size) {
-				rc = -EMSGSIZE;
-				goto out_unlock;
-			}
+		/*  Try to get a message from this underlying socket */
+		rc = sp_decoder_get_message(&usock->decoder, size,
+			&msg_data, &msg_size);
 
-			/* Copy the message data to supplied buffer */
-			rc = memcpy_toiovec(msg->msg_iov, usock->inmsg_data,
-				usock->inmsg_size);
+		/* If there is a message, copy it to the supplied buffer */
+		if (rc == 0) {
+			rc = memcpy_toiovec(msg->msg_iov, msg_data, msg_size);
 			if (rc < 0)
 				goto out_unlock;
-
-			/* Return number of bytes read */
-			rc = usock->inmsg_size;
-
-			kfree(usock->inmsg_data);
-
-			usock->inmsg_data = NULL;
-			usock->inmsg_size = 0;
-			usock->inmsg_pos = 0;
-
-			/* Start reading new message */
-			sp_in_cb (usock->s->sk, 0);
-
+			rc = msg_size;
 			goto out_unlock;
 		}
+
+		/*  Forward the error up the stack */
+		if (rc != EAGAIN)
+			goto out_unlock;
 	}
 
 	/* There are no message and we are in the non-blocking mode */
@@ -459,7 +428,7 @@ loop:
 		goto out_unlock;
 	}
 
-	/* Wait till message arrives */
+	/* Wait till message arrives (unlock the socket mutex meanwhile) */
 	if (sp->recv_waiting != 1) {
 		sp->recv_waiting = 1;
 		init_completion(&sp->recv_wait);

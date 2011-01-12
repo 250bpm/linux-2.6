@@ -13,6 +13,8 @@
 #include <net/sock.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
+#include <net/sp_decoder.h>
+#include <net/sp_encoder.h>
 
 #ifdef __KERNEL__
 
@@ -27,10 +29,8 @@ struct sp_usock {
         /* Work performed on behalf of this socket */
         struct work_struct work_in;
         struct work_struct work_out;
-	/* The inbound message being received at the moment */
-        void *inmsg_data;
-        int inmsg_size;
-        int inmsg_pos;
+	/* The decoder to process inbound messages */
+	struct sp_decoder decoder;
 	/* The outbound message being sent at the moment */
         void *outmsg_data;
         int outmsg_size;
