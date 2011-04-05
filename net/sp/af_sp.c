@@ -33,6 +33,7 @@ static int sp_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
 static void sp_in_cb(struct sock *sk, int bytes);
 static void sp_out_cb(struct sock *sk);
 static void sp_listener_work_in(struct work_struct *work);
+static void sp_state_cb(struct sock *sk);
 
 /* SP protocol information */
 static struct proto sp_proto = {
@@ -113,6 +114,7 @@ int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
 	printk (KERN_INFO "%s: nbytes = %d\n", __func__, nbytes);
 	if (nbytes == -EAGAIN)
 		return nbytes;
+	/* TODO: Handle -EPIPE */
 	BUG_ON(nbytes < 0);
 	return nbytes;
 }
@@ -123,6 +125,9 @@ int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
 static void sp_usock_destroy (struct sp_usock *usock)
 {
 	struct sp_sock *owner = usock->owner;
+
+	printk(KERN_INFO "SP: Underlying connection %p deallocated\n",
+		usock->s->sk);
 	mutex_lock(&owner->sync);
 	sock_release(usock->s);
 	list_del(&usock->list);
@@ -239,12 +244,22 @@ static void sp_data_work_out(struct work_struct *work)
 	mutex_unlock(&usock->owner->sync);
 }
 
+static void sp_data_work_destroy(struct work_struct *work)
+{
+	struct sp_usock *usock = container_of(work,
+		struct sp_usock, work_destroy);
+
+	/*  No need to lock as usock_destroy does this */
+	sp_usock_destroy(usock);
+}
+
 /*
  * sp_register_usock: register new underlying socket with SP socket
  */
 static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	struct list_head *list, void (*infunc)(struct work_struct*),
-	void (*outfunc)(struct work_struct*))
+	void (*outfunc)(struct work_struct*),
+	void (*destroyfunc)(struct work_struct*))
 {
 	/* Basic initialisation */
 	sp_decoder_init(&usock->decoder, sp_usock_read);
@@ -254,10 +269,13 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	usock->s->sk->sk_user_data = (void *)usock;
 	INIT_WORK(&usock->work_in, infunc);
 	INIT_WORK(&usock->work_out, outfunc);
+	INIT_WORK(&usock->work_destroy, destroyfunc);
 	if (infunc)
 		usock->s->sk->sk_data_ready = sp_in_cb;
 	if (outfunc)
 		usock->s->sk->sk_write_space = sp_out_cb;
+	if (destroyfunc)
+		usock->s->sk->sk_state_change = sp_state_cb;
 
 	/* Add the new socket to the list of underlying sockets */
         usock->owner = owner;
@@ -298,7 +316,8 @@ static void sp_listener_work_in(struct work_struct *work)
 		/* Register the TCP socket with the SP socket */
 		sp_register_usock (listener->owner, new_usock,
 			&listener->owner->connections,
-			sp_data_work_in, sp_data_work_out);
+			sp_data_work_in, sp_data_work_out,
+			sp_data_work_destroy);
 
 		printk(KERN_INFO "SP: New underlying socket accepted");
 	}
@@ -330,6 +349,25 @@ static void sp_out_cb(struct sock *sk)
 	schedule_work(&usock->work_out);
 
 	printk(KERN_INFO "SP: out_cb");
+}
+
+/*
+ * sp_state_cb: A callback from underlying socket
+ *
+ * Called when an underlying socket changes TCP state.
+ * Currently only used to destroy the underlying socket in the event
+ * of a passive close (TCP_CLOSE_WAIT).
+ *
+ */
+static void sp_state_cb(struct sock *sk)
+{
+	printk(KERN_INFO "%s: (%p) sk->sk_state = %d\n", __func__, sk,
+		sk->sk_state);
+
+	if (sk->sk_state == TCP_CLOSE_WAIT) {
+		struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
+		schedule_work(&usock->work_destroy);
+	}
 }
 
 /*
@@ -488,7 +526,7 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 
 		/* Register the TCP listener socket with the SP socket */
 		sp_register_usock (sp, usock, &sp->listeners,
-			sp_listener_work_in, NULL);
+			sp_listener_work_in, NULL, NULL);
 
 		/* Bind and listen for connections on listener socket */
 		rc = kernel_bind(usock->s, (struct sockaddr *)&uaddr,
@@ -564,7 +602,8 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 
 		/* Register the TCP socket with the SP socket */
 		sp_register_usock (sp, usock, &sp->connections,
-			sp_data_work_in, sp_data_work_out);
+			sp_data_work_in, sp_data_work_out,
+			sp_data_work_destroy);
 
 		/* Start connecting to the peer */
 		rc = kernel_connect(usock->s, (struct sockaddr *)&uaddr,
@@ -612,7 +651,6 @@ static int sp_release(struct socket *sock)
 	/* First, destroy all the underlying connections */
 	list_for_each_entry_safe(it, next, &sp->connections, list) {
 		sp_usock_destroy (it);
-		printk(KERN_INFO "SP: Underlying connection deallocated\n");
 	}
 
 	/* Detach socket from process context. */

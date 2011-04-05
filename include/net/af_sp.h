@@ -29,6 +29,7 @@ struct sp_usock {
         /* Work performed on behalf of this socket */
         struct work_struct work_in;
         struct work_struct work_out;
+        struct work_struct work_destroy;
 	/* The decoder to process inbound messages */
 	struct sp_decoder decoder;
 	/* The encoder to process outbound messages */
