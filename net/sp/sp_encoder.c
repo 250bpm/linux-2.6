@@ -51,6 +51,8 @@ int sp_encoder_put_message(struct sp_encoder *ecdr, struct msghdr *msg, int len)
 {
 	int rc = 0;
 
+	printk (KERN_INFO "%s: len = %d\n", __func__, len);
+
 	/* If there's still message being sent return error */
 	if(!ecdr->msg_sent)
 		return -EAGAIN;
@@ -88,11 +90,16 @@ void sp_encoder_flush(struct sp_encoder *ecdr)
 
 	for(;;) {
 
-		/* If there's no data available exit */
+		/* If there's no data available run the state machine */
+		if (!ecdr->write_size)
+		ecdr->next(ecdr);
+		/* If the state machine supplied no data then exit */
 		if (!ecdr->write_size)
 			break;
 
 		/* Try to send the remaining data */
+		printk (KERN_INFO "%s: write_size = %d\n", __func__,
+			ecdr->write_size);
 		n = ecdr->write(ecdr, ecdr->write_pos, ecdr->write_size);
 		ecdr->write_pos += n;
 		ecdr->write_size -= n;
@@ -100,16 +107,13 @@ void sp_encoder_flush(struct sp_encoder *ecdr)
 		/* If more data cannot be sent exit */
 		if(ecdr->write_size)
 			break;
-
-		/* If there's no more data available run the state machine */
-		ecdr->next(ecdr);
 	}
 }
 
 static void sp_encoder_idle(struct sp_encoder *ecdr)
 {
-	if (ecdr->msg_size < 0xff) {
-		ecdr->buff[0] = (u8)ecdr->msg_size;
+	if (ecdr->msg_size + 1 < 0xff) {
+		ecdr->buff[0] = (u8)ecdr->msg_size + 1;
 		ecdr->buff[1] = 0;
 		ecdr->write_pos = ecdr->buff;
 		ecdr->write_size = 2;
@@ -118,7 +122,7 @@ static void sp_encoder_idle(struct sp_encoder *ecdr)
 	}
 
 	ecdr->buff[0] = 0xff;
-	sp_write_u64(ecdr->buff + 1, ecdr->msg_size);
+	sp_write_u64(ecdr->buff + 1, ecdr->msg_size + 1);
 	ecdr->buff[9] = 0;
 	ecdr->write_pos = ecdr->buff;
 	ecdr->write_size = 10;
@@ -139,5 +143,6 @@ static void sp_encoder_data_ready(struct sp_encoder *ecdr)
 
 	ecdr->write_pos = NULL;
 	ecdr->write_size = 0;
+	ecdr->msg_sent = 1;
 	ecdr->next = sp_encoder_idle;
 }

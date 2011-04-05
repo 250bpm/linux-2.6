@@ -86,6 +86,33 @@ int sp_usock_read(struct sp_decoder *dcdr, void *data, int size)
 	vec.iov_len = size;
 	nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, vec.iov_len,
 		MSG_DONTWAIT);
+	printk (KERN_INFO "%s: (%p) size = %d nbytes = %d\n", __func__,
+		usock->s->sk, size, nbytes);
+	if (nbytes == -EAGAIN)
+		return 0;
+	BUG_ON(nbytes < 0);
+	return nbytes;
+}
+
+/*
+ * sp_usock_write: this function is used by encoder to write data to
+                   the underlying socket
+ */
+int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
+{
+	struct sp_usock *usock = container_of(ecdr, struct sp_usock, encoder);
+	struct kvec vec;
+	struct msghdr hdr;
+	int nbytes;
+
+	memset (&hdr, 0, sizeof hdr);
+	hdr.msg_flags = MSG_DONTWAIT;
+	vec.iov_base = (char *)data;
+	vec.iov_len = size;
+	nbytes = kernel_sendmsg(usock->s, &hdr, &vec, 1, vec.iov_len);
+	printk (KERN_INFO "%s: nbytes = %d\n", __func__, nbytes);
+	if (nbytes == -EAGAIN)
+		return nbytes;
 	BUG_ON(nbytes < 0);
 	return nbytes;
 }
@@ -100,6 +127,7 @@ static void sp_usock_destroy (struct sp_usock *usock)
 	sock_release(usock->s);
 	list_del(&usock->list);
 	sp_decoder_destroy(&usock->decoder);
+	sp_encoder_destroy(&usock->encoder);
 	kfree(usock);
 	mutex_unlock(&owner->sync);
 }
@@ -131,8 +159,8 @@ static int sp_parse_address (const char *string, int *protocol,
 
 		/* TCP */
 		*protocol = SP_PROTOCOL_TCP;
-                addr_in = (struct sockaddr_in *)addr;
-                *addr_len = sizeof(struct sockaddr_in);		
+		addr_in = (struct sockaddr_in *)addr;
+		*addr_len = sizeof(struct sockaddr_in);
 
 		/* First, set the address family */
 		addr_in->sin_family = AF_INET;
@@ -196,31 +224,16 @@ static void sp_data_work_out(struct work_struct *work)
 {
 	struct sp_usock *usock = container_of(work,
 		struct sp_usock, work_out);
-	struct kvec vec;
-	struct msghdr hdr;
-	int nbytes;
 
 	mutex_lock(&usock->owner->sync);
 
 	/* Try to send the remaining part of the message */
-	memset (&hdr, 0, sizeof hdr);
-	vec.iov_base = (char *)usock->outmsg_data + usock->outmsg_pos;
-	vec.iov_len = usock->outmsg_size - usock->outmsg_pos;
-	nbytes = kernel_sendmsg(usock->s, &hdr, &vec, 1, vec.iov_len);
-	BUG_ON(nbytes < 0);
-	usock->outmsg_pos += nbytes;
+	sp_encoder_flush (&usock->encoder);
 
-	/*  If the message is fully sent, clean the buffer */
-	if (usock->outmsg_data && usock->outmsg_pos == usock->outmsg_size) {
-		kfree(usock->outmsg_data);
-		usock->outmsg_data = NULL;
-		usock->outmsg_size = 0;
-		usock->outmsg_pos = 0;
-
-		if(usock->owner->send_waiting) {
-			usock->owner->send_waiting = 0;
-			complete(&usock->owner->send_wait);
-		}
+	/*  If there's user thread waiting, unblock it */
+	if(usock->owner->send_waiting) {
+		usock->owner->send_waiting = 0;
+		complete(&usock->owner->send_wait);
 	}
 
 	mutex_unlock(&usock->owner->sync);
@@ -235,9 +248,7 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 {
 	/* Basic initialisation */
 	sp_decoder_init(&usock->decoder, sp_usock_read);
-	usock->outmsg_data = NULL;
-	usock->outmsg_size = 0;
-	usock->outmsg_pos = 0;
+	sp_encoder_init(&usock->encoder, sp_usock_write);
 
 	/* Install callback to be called when a new connection arrives */
 	usock->s->sk->sk_user_data = (void *)usock;
@@ -262,8 +273,8 @@ static void sp_listener_work_in(struct work_struct *work)
 {
 	struct sp_usock *listener = container_of(work,
 		struct sp_usock, work_in);
-        struct socket *new_sock;
-        struct sp_usock *new_usock;
+	struct socket *new_sock;
+	struct sp_usock *new_usock;
 	int rc;
 
 	for(;;) {
@@ -271,7 +282,7 @@ static void sp_listener_work_in(struct work_struct *work)
 		/* Accept the new connection */
 		rc = kernel_accept(listener->s, &new_sock, 0);
 		if (rc == -EAGAIN)
-	      		break;
+			break;
 		if (rc < 0) {
 			printk(KERN_INFO "%s: accept returned %d\n",
 				__func__, -rc);
@@ -281,11 +292,11 @@ static void sp_listener_work_in(struct work_struct *work)
 
 		/* Allocate and initialise the underlying socket */
 		new_usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
-	        BUG_ON (!new_usock);
+		BUG_ON (!new_usock);
 		new_usock->s = new_sock;
 
 		/* Register the TCP socket with the SP socket */
-	        sp_register_usock (listener->owner, new_usock,
+		sp_register_usock (listener->owner, new_usock,
 			&listener->owner->connections,
 			sp_data_work_in, sp_data_work_out);
 
@@ -300,11 +311,11 @@ static void sp_listener_work_in(struct work_struct *work)
  */
 static void sp_in_cb(struct sock *sk, int bytes)
 {
-        /* Add the work to global workqueue, if not already there */
-        struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
+	/* Add the work to global workqueue, if not already there */
+	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 	schedule_work(&usock->work_in);
 
-	printk(KERN_INFO "SP: in_cb bytes=%d", (int) bytes);
+	printk(KERN_INFO "SP: in_cb (%p) bytes=%d", sk, (int) bytes);
 }
 
 /*
@@ -314,9 +325,11 @@ static void sp_in_cb(struct sock *sk, int bytes)
  */
 static void sp_out_cb(struct sock *sk)
 {
-        /* Add the work to global workqueue, if not already there */
-        struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
+	/* Add the work to global workqueue, if not already there */
+	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 	schedule_work(&usock->work_out);
+
+	printk(KERN_INFO "SP: out_cb");
 }
 
 /*
@@ -329,35 +342,20 @@ static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	int rc = 0;
 	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
 
-printk(KERN_INFO "SP: send flags=%d", (int) msg->msg_flags);
-
-	/* At the moment, the size is stored as a single byte */
-	if (len > 0xff)
-		return -EMSGSIZE;
-
 	mutex_lock(&sp->sync);
 
 loop:
 	list_for_each_entry(usock, &sp->connections, list) {
-		if(!usock->outmsg_data) {
 
-			usock->outmsg_data = kmalloc(len + 1, GFP_KERNEL);
-			if (!usock->outmsg_data) {
-				rc = -ENOMEM;
-				goto out_unlock;
-			}
-			*((unsigned char*)usock->outmsg_data) = len;
-			rc = memcpy_fromiovec((char *)usock->outmsg_data + 1,
-				msg->msg_iov, len);
+		/* Try to put the message to the specific underlying socket */
+		rc = sp_encoder_put_message(&usock->encoder, msg, len);
+		if (rc != -EAGAIN) {
+
+			/* Forward the error to the caller */
 			if (rc < 0)
 				goto out_unlock;
-			usock->outmsg_size = len;
-			usock->outmsg_pos = 0;
 
-			/* Start sending the message */
-			sp_out_cb(usock->s->sk);
-
-			/* All the bytes are sent */
+			/* Message successfully sent */
 			rc = len;
 			goto out_unlock;
 		}
@@ -418,7 +416,7 @@ loop:
 		}
 
 		/*  Forward the error up the stack */
-		if (rc != EAGAIN)
+		if (rc != -EAGAIN)
 			goto out_unlock;
 	}
 
@@ -453,11 +451,11 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 {
 	struct sock *sk = sock->sk;
 	struct sp_sock *sp = (struct sp_sock *)sk;
-        struct sockaddr_sp *addr_sp;
-        struct sp_usock *usock;
+	struct sockaddr_sp *addr_sp;
+	struct sp_usock *usock;
 	int protocol;
-        struct sockaddr_storage uaddr;
-        int uaddr_len;
+	struct sockaddr_storage uaddr;
+	int uaddr_len;
 	int rc;
 
 	/* Cast the address to proper SP address */
@@ -475,12 +473,12 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 	if (rc < 0)
 		goto out;
 
-        /* Allocate and initialise the underlying socket */
-        usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
-        if (!usock) {
+	/* Allocate and initialise the underlying socket */
+	usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
+	if (!usock) {
 		rc = -ENOMEM;
-                goto out;
-        }
+		goto out;
+	}
 
 	if (protocol == SP_PROTOCOL_TCP) {
 		rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP,
@@ -514,9 +512,9 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 
 out_release:
 	sock_release(usock->s);
-        list_del(&usock->list);
+	list_del(&usock->list);
 out_dealloc:
-        kfree(usock);
+	kfree(usock);
 out:
 	return rc;
 }
@@ -529,11 +527,11 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 {
 	struct sock *sk = sock->sk;
 	struct sp_sock *sp = (struct sp_sock *)sk;
-        struct sockaddr_sp *addr_sp;
-        struct sp_usock *usock;
+	struct sockaddr_sp *addr_sp;
+	struct sp_usock *usock;
 	int protocol;
-        struct sockaddr_storage uaddr;
-        int uaddr_len;
+	struct sockaddr_storage uaddr;
+	int uaddr_len;
 	int rc;
 
 	/* Cast the address to proper SP address */
@@ -551,12 +549,12 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	if (rc < 0)
 		goto out;
 
-        /* Allocate and initialise the underlying socket */
-        usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
-        if (!usock) {
+	/* Allocate and initialise the underlying socket */
+	usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
+	if (!usock) {
 		rc = -ENOMEM;
-                goto out;
-        }
+		goto out;
+	}
 
 	if (protocol == SP_PROTOCOL_TCP) {
 		rc = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP,
@@ -586,9 +584,9 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 
 out_release:
 	sock_release(usock->s);
-        list_del(&usock->list);
+	list_del(&usock->list);
 out_dealloc:
-        kfree(usock);
+	kfree(usock);
 out:
 	return rc;
 }
@@ -599,25 +597,25 @@ out:
 static int sp_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
-        struct sp_sock *sp = (struct sp_sock *)sk;
-        struct sp_usock *it, *next;
+	struct sp_sock *sp = (struct sp_sock *)sk;
+	struct sp_usock *it, *next;
 
 	if (!sk)
 		return 0;
 
-        /* First, destroy all the underlying listeners */
+	/* First, destroy all the underlying listeners */
 	list_for_each_entry_safe(it, next, &sp->listeners, list) {
 		sp_usock_destroy (it);
 		printk(KERN_INFO "SP: Underlying listener deallocated\n");
 	}
 
-        /* First, destroy all the underlying connections */
+	/* First, destroy all the underlying connections */
 	list_for_each_entry_safe(it, next, &sp->connections, list) {
 		sp_usock_destroy (it);
 		printk(KERN_INFO "SP: Underlying connection deallocated\n");
 	}
 
-        /* Detach socket from process context. */
+	/* Detach socket from process context. */
 	sock_hold(sk);
 	sock_orphan(sk);
 	sock_put(sk);
@@ -649,15 +647,15 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	int kern)
 {
 	struct sock *sk;
-        struct sp_sock *sp;
+	struct sp_sock *sp;
 
 	if (protocol && protocol != PF_SP)
 		return -EPROTONOSUPPORT;
 
-        /* Set up the table of virtual functions for the socket */
-        sock->ops = &sp_sock_ops;
+	/* Set up the table of virtual functions for the socket */
+	sock->ops = &sp_sock_ops;
 
-       	/* Allocate private data */
+	/* Allocate private data */
 	sk = sk_alloc(net, PF_SP, GFP_KERNEL, &sp_proto);
 	if (!sk)
 		return -ENOMEM;

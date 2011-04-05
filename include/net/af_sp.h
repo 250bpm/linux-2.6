@@ -31,10 +31,8 @@ struct sp_usock {
         struct work_struct work_out;
 	/* The decoder to process inbound messages */
 	struct sp_decoder decoder;
-	/* The outbound message being sent at the moment */
-        void *outmsg_data;
-        int outmsg_size;
-        int outmsg_pos;
+	/* The encoder to process outbound messages */
+	struct sp_encoder encoder;
 };
 
 /* The AF_SP socket private data */

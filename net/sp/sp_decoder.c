@@ -66,7 +66,8 @@ int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
 
 		/* Try to read as much data as required by the state machine */
 		n = dcdr->read(dcdr, dcdr->read_pos, dcdr->read_size);
-printk(KERN_INFO "SP: reading %d read %d", (int) dcdr->read_size, (int) n);
+		printk(KERN_INFO "SP: reading %d read %d",
+			(int) dcdr->read_size, (int) n);
 		dcdr->read_pos += n;
 		dcdr->read_size -= n;
 
@@ -112,6 +113,7 @@ static void sp_decoder_alloc_message(struct sp_decoder *dcdr, int size)
 static void sp_decoder_one_byte_size_ready(struct sp_decoder *dcdr)
 {
 	u8 size = dcdr->buff[0];
+	printk (KERN_INFO "%s: %d\n", __func__, size);
 
 	if(size == 0xff) {
 		dcdr->read_pos = dcdr->buff;
