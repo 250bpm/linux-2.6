@@ -20,29 +20,33 @@
 
 /* A single underlying socket */
 struct sp_usock {
-        /* Each SP socket has a list of usocks */
-        struct list_head list;
-        /* The SP socket owning this underlying socket */
-        struct sp_sock *owner;
+	/* Each SP socket has a list of usocks */
+	struct list_head list;
+	/* The SP socket owning this underlying socket */
+	struct sp_sock *owner;
 	/* The underlying socket itself */
 	struct socket *s;
-        /* Work performed on behalf of this socket */
-        struct work_struct work_in;
-        struct work_struct work_out;
-        struct work_struct work_destroy;
+	/* Work performed on behalf of this socket */
+	struct work_struct work_in;
+	struct work_struct work_out;
+	struct work_struct work_destroy;
 	/* The decoder to process inbound messages */
 	struct sp_decoder decoder;
 	/* The encoder to process outbound messages */
 	struct sp_encoder encoder;
+	/* Saved callbacks from the underlying socket */
+	void (*old_sk_state_change)(struct sock *);
+	void (*old_sk_data_ready)(struct sock *, int);
+	void (*old_sk_write_space)(struct sock *);
 };
 
 /* The AF_SP socket private data */
 struct sp_sock {
-        /* WARNING: sk has to be the first member */
-        struct sock sk;
-        /* Lists of underlying sockets */
-        struct list_head listeners;
-        struct list_head connections;
+	/* WARNING: sk has to be the first member */
+	struct sock sk;
+	/* Lists of underlying sockets */
+	struct list_head listeners;
+	struct list_head connections;
 	/* Mutex to synchronise user-space threads with kernel workqueues */
 	struct mutex sync;
 	/* Completion to wait on in send calls */

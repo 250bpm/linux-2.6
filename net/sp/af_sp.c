@@ -87,7 +87,7 @@ int sp_usock_read(struct sp_decoder *dcdr, void *data, int size)
 	vec.iov_len = size;
 	nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, vec.iov_len,
 		MSG_DONTWAIT);
-	printk (KERN_INFO "%s: (%p) size = %d nbytes = %d\n", __func__,
+	printk (KERN_INFO "SP: %s sk=%p size=%d nbytes=%d\n", __func__,
 		usock->s->sk, size, nbytes);
 	if (nbytes == -EAGAIN)
 		return 0;
@@ -111,7 +111,8 @@ int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
 	vec.iov_base = (char *)data;
 	vec.iov_len = size;
 	nbytes = kernel_sendmsg(usock->s, &hdr, &vec, 1, vec.iov_len);
-	printk (KERN_INFO "%s: nbytes = %d\n", __func__, nbytes);
+	printk (KERN_INFO "SP: %s sk=%p size=%d nbytes=%d\n", __func__,
+		usock->s->sk, size, nbytes);
 	if (nbytes == -EAGAIN)
 		return nbytes;
 	/* TODO: Handle -EPIPE */
@@ -120,14 +121,29 @@ int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
 }
 
 /*
- * sp_uscok_destroy: clean up the underlying socket
+ * sp_usock_destroy: clean up the underlying socket
  */
-static void sp_usock_destroy (struct sp_usock *usock)
+static void sp_usock_destroy (struct sp_usock *usock, int sync)
 {
 	struct sp_sock *owner = usock->owner;
 
-	printk(KERN_INFO "SP: Underlying connection %p deallocated\n",
-		usock->s->sk);
+	printk(KERN_INFO "SP: %s owner=%p sk=%p\n", __func__, usock->s->sk,
+		usock->owner);
+
+	/* Restore old socket callbacks */
+	write_lock_bh(&usock->s->sk->sk_callback_lock);
+	usock->s->sk->sk_state_change = usock->old_sk_state_change;
+	usock->s->sk->sk_data_ready = usock->old_sk_data_ready;
+	usock->s->sk->sk_write_space = usock->old_sk_write_space;
+	write_unlock_bh(&usock->s->sk->sk_callback_lock);
+
+	/* Ensure any work items on the socket have completed */
+	cancel_work_sync(&usock->work_in);
+	cancel_work_sync(&usock->work_out);
+	if (sync)
+		cancel_work_sync(&usock->work_destroy);
+
+	/* Deallocate the socket */
 	mutex_lock(&owner->sync);
 	sock_release(usock->s);
 	list_del(&usock->list);
@@ -250,7 +266,7 @@ static void sp_data_work_destroy(struct work_struct *work)
 		struct sp_usock, work_destroy);
 
 	/*  No need to lock as usock_destroy does this */
-	sp_usock_destroy(usock);
+	sp_usock_destroy(usock, 0);
 }
 
 /*
@@ -265,23 +281,33 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	sp_decoder_init(&usock->decoder, sp_usock_read);
 	sp_encoder_init(&usock->encoder, sp_usock_write);
 
-	/* Install callback to be called when a new connection arrives */
-	usock->s->sk->sk_user_data = (void *)usock;
+	/* Initialize work items for this socket */
 	INIT_WORK(&usock->work_in, infunc);
 	INIT_WORK(&usock->work_out, outfunc);
 	INIT_WORK(&usock->work_destroy, destroyfunc);
+
+	/* Install callbacks for work items */
+	write_lock_bh(&usock->s->sk->sk_callback_lock);
+	usock->s->sk->sk_user_data = (void *)usock;
+	usock->old_sk_state_change = usock->s->sk->sk_state_change;
+	usock->old_sk_data_ready = usock->s->sk->sk_data_ready;
+	usock->old_sk_write_space = usock->s->sk->sk_write_space;
 	if (infunc)
 		usock->s->sk->sk_data_ready = sp_in_cb;
 	if (outfunc)
 		usock->s->sk->sk_write_space = sp_out_cb;
 	if (destroyfunc)
 		usock->s->sk->sk_state_change = sp_state_cb;
+	write_unlock_bh(&usock->s->sk->sk_callback_lock);
 
 	/* Add the new socket to the list of underlying sockets */
         usock->owner = owner;
 	mutex_lock (&owner->sync);
 	list_add(&usock->list, list);
 	mutex_unlock (&owner->sync);
+
+	printk (KERN_INFO "SP: %s owner=%p sk=%p\n", __func__, usock->owner,
+		usock->s->sk);
 }
 
 /*
@@ -298,15 +324,14 @@ static void sp_listener_work_in(struct work_struct *work)
 	for(;;) {
 
 		/* Accept the new connection */
-		rc = kernel_accept(listener->s, &new_sock, 0);
+		rc = kernel_accept(listener->s, &new_sock, O_NONBLOCK);
 		if (rc == -EAGAIN)
 			break;
 		if (rc < 0) {
-			printk(KERN_INFO "%s: accept returned %d\n",
+			printk(KERN_INFO "SP: %s: accept returned %d\n",
 				__func__, -rc);
 			return;
 		}
-
 
 		/* Allocate and initialise the underlying socket */
 		new_usock = kmalloc(sizeof (struct sp_usock), GFP_KERNEL);
@@ -314,12 +339,12 @@ static void sp_listener_work_in(struct work_struct *work)
 		new_usock->s = new_sock;
 
 		/* Register the TCP socket with the SP socket */
+		printk(KERN_INFO "SP: %s registering accepted peer sk=%p\n",
+			__func__, new_usock->s->sk);
 		sp_register_usock (listener->owner, new_usock,
 			&listener->owner->connections,
 			sp_data_work_in, sp_data_work_out,
 			sp_data_work_destroy);
-
-		printk(KERN_INFO "SP: New underlying socket accepted");
 	}
 }
 
@@ -330,11 +355,13 @@ static void sp_listener_work_in(struct work_struct *work)
  */
 static void sp_in_cb(struct sock *sk, int bytes)
 {
-	/* Add the work to global workqueue, if not already there */
 	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
-	schedule_work(&usock->work_in);
 
-	printk(KERN_INFO "SP: in_cb (%p) bytes=%d", sk, (int) bytes);
+	printk(KERN_INFO "SP: in_cb owner=%p sk=%p bytes=%d\n", usock->owner,
+		sk, (int) bytes);
+
+	/* Add the work to global workqueue, if not already there */
+	schedule_work(&usock->work_in);
 }
 
 /*
@@ -344,11 +371,12 @@ static void sp_in_cb(struct sock *sk, int bytes)
  */
 static void sp_out_cb(struct sock *sk)
 {
-	/* Add the work to global workqueue, if not already there */
 	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
-	schedule_work(&usock->work_out);
 
-	printk(KERN_INFO "SP: out_cb");
+	printk(KERN_INFO "SP: out_cb owner=%p sk=%p\n", usock->owner, sk);
+
+	/* Add the work to global workqueue, if not already there */
+	schedule_work(&usock->work_out);
 }
 
 /*
@@ -361,13 +389,15 @@ static void sp_out_cb(struct sock *sk)
  */
 static void sp_state_cb(struct sock *sk)
 {
-	printk(KERN_INFO "%s: (%p) sk->sk_state = %d\n", __func__, sk,
-		sk->sk_state);
+	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 
-	if (sk->sk_state == TCP_CLOSE_WAIT) {
-		struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
+	printk(KERN_INFO "SP: state_cb owner=%p sk=%p sk_state=%d\n",
+		usock->owner, sk, sk->sk_state);
+
+	/* Remote peer has closed the connection, schedule work item to
+	   deregister the underlying socket */
+	if (sk->sk_state == TCP_CLOSE_WAIT)
 		schedule_work(&usock->work_destroy);
-	}
 }
 
 /*
@@ -525,6 +555,8 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 			goto out_dealloc;
 
 		/* Register the TCP listener socket with the SP socket */
+		printk(KERN_INFO "SP: %s registering listener sk=%p\n",
+			__func__, usock->s->sk);
 		sp_register_usock (sp, usock, &sp->listeners,
 			sp_listener_work_in, NULL, NULL);
 
@@ -579,7 +611,7 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	}
 	addr_sp = (struct sockaddr_sp *)addr;
 
-	printk(KERN_INFO "SP: Connecting to %s", addr_sp->ssp_endpoint);
+	printk(KERN_INFO "SP: Connecting to %s\n", addr_sp->ssp_endpoint);
 
 	/* Convert the textual address into a structure */
 	rc = sp_parse_address (addr_sp->ssp_endpoint, &protocol,
@@ -601,6 +633,8 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 			goto out_dealloc;
 
 		/* Register the TCP socket with the SP socket */
+		printk(KERN_INFO "SP: %s: registering connected peer sk=%p\n",
+			__func__, usock->s->sk);
 		sp_register_usock (sp, usock, &sp->connections,
 			sp_data_work_in, sp_data_work_out,
 			sp_data_work_destroy);
@@ -644,13 +678,13 @@ static int sp_release(struct socket *sock)
 
 	/* First, destroy all the underlying listeners */
 	list_for_each_entry_safe(it, next, &sp->listeners, list) {
-		sp_usock_destroy (it);
+		sp_usock_destroy (it, 1);
 		printk(KERN_INFO "SP: Underlying listener deallocated\n");
 	}
 
 	/* First, destroy all the underlying connections */
 	list_for_each_entry_safe(it, next, &sp->connections, list) {
-		sp_usock_destroy (it);
+		sp_usock_destroy (it, 1);
 	}
 
 	/* Detach socket from process context. */
@@ -658,9 +692,9 @@ static int sp_release(struct socket *sock)
 	sock_orphan(sk);
 	sock_put(sk);
 
+	printk(KERN_INFO "SP: %s destroyed SP socket sk=%p\n", __func__,
+		sock->sk);
 	sock->sk = NULL;
-
-	printk(KERN_INFO "SP: Socket destroyed");
 
 	return 0;
 }
@@ -715,7 +749,7 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
 	local_bh_enable();
 
-	printk(KERN_INFO "SP: Socket created");
+	printk(KERN_INFO "SP: %s created SP socket sk=%p\n", __func__, sp);
 
 	return 0;
 }

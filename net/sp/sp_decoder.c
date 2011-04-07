@@ -3,6 +3,7 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <net/sp_decoder.h>
+#include <net/af_sp.h>
 
 static inline u64 sp_read_u64 (u8 *buff);
 static void sp_decoder_alloc_message(struct sp_decoder *dcdr, int size);
@@ -35,6 +36,9 @@ static inline u64 sp_read_u64 (u8 *buff)
 void sp_decoder_init(struct sp_decoder *dcdr,
 	int (*read)(struct sp_decoder*, void*, int))
 {
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
+
 	dcdr->read = read;
 	dcdr->msg_data = NULL;
 	dcdr->msg_size = 0;
@@ -51,6 +55,9 @@ void sp_decoder_init(struct sp_decoder *dcdr,
  */
 void sp_decoder_destroy(struct sp_decoder *dcdr)
 {
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
+
 	if (dcdr->msg_data)
 		kfree(dcdr->msg_data);
 }
@@ -59,15 +66,15 @@ int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
 	void **data, int *size)
 {
 	int n;
-
-	printk(KERN_INFO "SP: %s", __func__);
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
 
 	while(1) {
 
 		/* Try to read as much data as required by the state machine */
 		n = dcdr->read(dcdr, dcdr->read_pos, dcdr->read_size);
-		printk(KERN_INFO "SP: reading %d read %d",
-			(int) dcdr->read_size, (int) n);
+		printk(KERN_INFO "SP: sk=%p reading %d read %d",
+			usock->s->sk, (int) dcdr->read_size, (int) n);
 		dcdr->read_pos += n;
 		dcdr->read_size -= n;
 
@@ -100,6 +107,9 @@ int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
  */
 static void sp_decoder_alloc_message(struct sp_decoder *dcdr, int size)
 {
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p size=%d\n", __func__, usock->s->sk,
+		size);
 	BUG_ON(size < 1);
 	dcdr->msg_data = kmalloc(size - 1, GFP_KERNEL);
 	BUG_ON(!dcdr->msg_data);
@@ -113,7 +123,9 @@ static void sp_decoder_alloc_message(struct sp_decoder *dcdr, int size)
 static void sp_decoder_one_byte_size_ready(struct sp_decoder *dcdr)
 {
 	u8 size = dcdr->buff[0];
-	printk (KERN_INFO "%s: %d\n", __func__, size);
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p size=%d\n", __func__, usock->s->sk,
+		size);
 
 	if(size == 0xff) {
 		dcdr->read_pos = dcdr->buff;
@@ -133,6 +145,8 @@ static void sp_decoder_eight_byte_size_ready(struct sp_decoder *dcdr)
 
 static void sp_decoder_flags_ready(struct sp_decoder *dcdr)
 {
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
 	/* Ignore the flags for now and continue on */
 	dcdr->read_pos = dcdr->msg_data;
 	dcdr->read_size = dcdr->msg_size;
@@ -141,5 +155,7 @@ static void sp_decoder_flags_ready(struct sp_decoder *dcdr)
 
 static void sp_decoder_data_ready(struct sp_decoder *dcdr)
 {
+	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
+	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
 	dcdr->msg_ready = 1;
 }
