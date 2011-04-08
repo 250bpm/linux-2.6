@@ -50,8 +50,10 @@ void sp_encoder_destroy(struct sp_encoder *ecdr)
 	struct sp_usock *usock = container_of(ecdr, struct sp_usock, encoder);
 	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
 
-	if(ecdr->msg_data)
+	if(ecdr->msg_data) {
 		kfree(ecdr->msg_data);
+		ecdr->msg_data = NULL;
+	}
 }
 
 int sp_encoder_put_message(struct sp_encoder *ecdr, struct msghdr *msg, int len)
@@ -158,8 +160,10 @@ static void sp_encoder_data_ready(struct sp_encoder *ecdr)
 	struct sp_usock *usock = container_of(ecdr, struct sp_usock, encoder);
 	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
 
-	if (ecdr->msg_data)
+	if (ecdr->msg_data) {
 		kfree(ecdr->msg_data);
+		ecdr->msg_data = NULL;
+	}
 
 	ecdr->write_pos = NULL;
 	ecdr->write_size = 0;

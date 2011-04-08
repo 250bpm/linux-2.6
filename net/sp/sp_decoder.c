@@ -58,8 +58,10 @@ void sp_decoder_destroy(struct sp_decoder *dcdr)
 	struct sp_usock *usock = container_of(dcdr, struct sp_usock, decoder);
 	printk (KERN_INFO "SP: %s sk=%p\n", __func__, usock->s->sk);
 
-	if (dcdr->msg_data)
+	if (dcdr->msg_data) {
 		kfree(dcdr->msg_data);
+		dcdr->msg_data = NULL;
+	}
 }
 
 int sp_decoder_get_message(struct sp_decoder *dcdr, int maxsize,
