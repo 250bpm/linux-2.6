@@ -59,6 +59,9 @@ struct sp_sock {
 	struct completion recv_wait;
 	/* If 1 user thread is being blocked on recv */
 	int recv_waiting;
+	/* Pointers to current in/out usock */
+	struct list_head *current_in;
+	struct list_head *current_out;
 };
 
 #endif
