@@ -37,6 +37,26 @@ static void sp_out_cb(struct sock *sk);
 static void sp_listener_work_in(struct work_struct *work);
 static void sp_state_cb(struct sock *sk);
 
+/**
+ * list_for_each_circular - iterate over a circular list starting at pos
+ * @pos: the position to start at in the list
+ * @head: the list to iterate over
+ * @_saved: temporary saved position, space must be supplied by caller
+ *
+ * Description:
+ * treats list as a circular linked list and starts iteration at pos;
+ * iterates over all elements, skipping the list head, until pos is reached
+ * again.
+ *
+ */
+ /* TODO: fix warnings */
+#define list_for_each_circular(pos, head, _saved) \
+	for (_saved = NULL, pos = pos->next, (pos == head) && (pos = pos->next); \
+	     (_saved != NULL || pos != head) && pos != _saved; \
+	     (_saved == NULL) && (_saved = pos), \
+	     pos = pos->next, \
+	     (pos == head) && (pos = pos->next))
+
 /* SP protocol information */
 static struct proto sp_proto = {
         .name =         "SP",
@@ -89,8 +109,6 @@ int sp_usock_read(struct sp_decoder *dcdr, void *data, int size)
 	vec.iov_len = size;
 	nbytes = kernel_recvmsg(usock->s, &hdr, &vec, 1, vec.iov_len,
 		MSG_DONTWAIT);
-	printk (KERN_INFO "SP: %s sk=%p size=%d nbytes=%d\n", __func__,
-		usock->s->sk, size, nbytes);
 	if (nbytes == -EAGAIN)
 		return 0;
 	BUG_ON(nbytes < 0);
@@ -113,8 +131,6 @@ int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
 	vec.iov_base = (char *)data;
 	vec.iov_len = size;
 	nbytes = kernel_sendmsg(usock->s, &hdr, &vec, 1, vec.iov_len);
-	printk (KERN_INFO "SP: %s sk=%p size=%d nbytes=%d\n", __func__,
-		usock->s->sk, size, nbytes);
 	if (nbytes == -EAGAIN)
 		return nbytes;
 	/* TODO: Handle -EPIPE */
@@ -128,9 +144,6 @@ int sp_usock_write(struct sp_encoder *ecdr, void *data, int size)
 static void sp_usock_destroy (struct sp_usock *usock, int sync)
 {
 	struct sp_sock *owner = usock->owner;
-
-	printk(KERN_INFO "SP: %s owner=%p sk=%p\n", __func__, usock->s->sk,
-		usock->owner);
 
 	/* Restore old socket callbacks */
 	write_lock_bh(&usock->s->sk->sk_callback_lock);
@@ -148,27 +161,14 @@ static void sp_usock_destroy (struct sp_usock *usock, int sync)
 	/* Deallocate the socket */
 	mutex_lock(&owner->sync);
 	sock_release(usock->s);
-	if (owner->current_in == &usock->list) {
-		if (list_is_singular(&owner->connections)) {
-			owner->current_in = NULL;
-		}
-		else {
-			owner->current_in = usock->list.next;
-			if (owner->current_in == &owner->connections)
-				owner->current_in = owner->current_in->next;
-		}
-	}
-	if (owner->current_out == &usock->list) {
-		if (list_is_singular(&owner->connections)) {
-			owner->current_out = NULL;
-		}
-		else {
-			owner->current_out = usock->list.next;
-			if (owner->current_out == &owner->connections)
-				owner->current_out = owner->current_out->next;
-		}
-	}
 	list_del(&usock->list);
+
+	/* If current pipe is being deleted reset current to 1st item */
+	if (owner->current_in == &usock->list)
+		owner->current_in = owner->connections.next;
+	if (owner->current_out == &usock->list)
+		owner->current_out = owner->connections.next;
+
 	sp_decoder_destroy(&usock->decoder);
 	sp_encoder_destroy(&usock->encoder);
 	kfree(usock);
@@ -332,9 +332,9 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	else if (type == SP_USOCK_CONNECTION) {
 		list_add(&usock->list, &owner->connections);
 		/* New usock becomes current if none set */
-		if (!owner->current_in)
+		if (owner->current_in == &owner->connections)
 			owner->current_in = &usock->list;
-		if (!owner->current_out)
+		if (owner->current_out == &owner->connections)
 			owner->current_out = &usock->list;
 	}
 	else {
@@ -346,9 +346,6 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 		complete(&owner->send_wait);
 	}
 	mutex_unlock (&owner->sync);
-
-	printk (KERN_INFO "SP: %s owner=%p sk=%p\n", __func__, usock->owner,
-		usock->s->sk);
 }
 
 /*
@@ -369,7 +366,7 @@ static void sp_listener_work_in(struct work_struct *work)
 		if (rc == -EAGAIN)
 			break;
 		if (rc < 0) {
-			printk(KERN_INFO "SP: %s: accept returned %d\n",
+			printk(KERN_WARNING "SP: %s: accept returned %d\n",
 				__func__, -rc);
 			return;
 		}
@@ -380,8 +377,6 @@ static void sp_listener_work_in(struct work_struct *work)
 		new_usock->s = new_sock;
 
 		/* Register the TCP socket with the SP socket */
-		printk(KERN_INFO "SP: %s registering accepted peer sk=%p\n",
-			__func__, new_usock->s->sk);
 		sp_register_usock (listener->owner, new_usock,
 			SP_USOCK_CONNECTION,
 			sp_data_work_in, sp_data_work_out,
@@ -398,9 +393,6 @@ static void sp_in_cb(struct sock *sk, int bytes)
 {
 	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 
-	printk(KERN_INFO "SP: in_cb owner=%p sk=%p bytes=%d\n", usock->owner,
-		sk, (int) bytes);
-
 	/* Add the work to global workqueue, if not already there */
 	schedule_work(&usock->work_in);
 }
@@ -414,8 +406,6 @@ static void sp_out_cb(struct sock *sk)
 {
 	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 
-	printk(KERN_INFO "SP: out_cb owner=%p sk=%p\n", usock->owner, sk);
-
 	/* Add the work to global workqueue, if not already there */
 	schedule_work(&usock->work_out);
 }
@@ -424,19 +414,14 @@ static void sp_out_cb(struct sock *sk)
  * sp_state_cb: A callback from underlying socket
  *
  * Called when an underlying socket changes TCP state.
- * Currently only used to destroy the underlying socket in the event
- * of a passive close (TCP_CLOSE_WAIT).
  *
  */
 static void sp_state_cb(struct sock *sk)
 {
 	struct sp_usock *usock = (struct sp_usock *)(sk->sk_user_data);
 
-	printk(KERN_INFO "SP: state_cb owner=%p sk=%p sk_state=%d\n",
-		usock->owner, sk, sk->sk_state);
-
 	write_lock_bh(sk->sk_callback_lock);
-	/* kernel_connect() has completed on this socket */
+	/* kernel_connect() has completed on this socket, mark active */
 	if (sk->sk_state == TCP_ESTABLISHED)
 		usock->active = 1;
 	/* Remote peer has closed the connection, schedule work item to
@@ -444,17 +429,6 @@ static void sp_state_cb(struct sock *sk)
 	else if (sk->sk_state == TCP_CLOSE_WAIT)
 		schedule_work(&usock->work_destroy);
 	write_unlock_bh(sk->sk_callback_lock);
-}
-
-static int sp_advance_current(struct list_head *start_pos,
-	struct list_head **cur, struct list_head* head)
-{
-	*cur = (*cur)->next;
-	if (*cur == head)
-	{
-		*cur = (*cur)->next;
-	}
-	return (*cur == start_pos);
 }
 
 /*
@@ -471,21 +445,12 @@ static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	mutex_lock(&sp->sync);
 
 loop:
-	if (list_empty (&sp->connections)) {
-		BUG_ON(sp->current_out != NULL);
-		goto wait;
-	}
-
-        start_pos = sp->current_out;
-	printk (KERN_INFO "SP: %s start_pos=%p\n", __func__, start_pos);
-	do {
+	list_for_each_circular(sp->current_out, &sp->connections, start_pos) {
 
 		usock = container_of (sp->current_out, struct sp_usock, list);
 
 		/* Skip inactive peers */
 		read_lock_bh(&usock->s->sk->sk_callback_lock);
-		printk (KERN_INFO "SP: %s owner=%p current=%p active=%d\n",
-			__func__, sp, usock->s->sk, usock->active);
 		if (!usock->active) {
 			read_unlock_bh(&usock->s->sk->sk_callback_lock);
 			continue;
@@ -503,12 +468,9 @@ loop:
 
 		/* Message successfully sent */
 		rc = len;
-		sp_advance_current(start_pos, &sp->current_out, &sp->connections);
 		goto out_unlock;
-	} while (sp_advance_current(start_pos, &sp->current_out, 
-		&sp->connections));
+	}
 
-wait:
 	/* Nowhere to send the message and we are in the non-blocking mode */
 	if (msg->msg_flags & MSG_DONTWAIT) {
 		rc = -EAGAIN;
@@ -548,14 +510,7 @@ static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 	mutex_lock(&sp->sync);
 
 loop:
-
-	if (list_empty (&sp->connections)) {
-		BUG_ON(sp->current_in != NULL);
-		goto wait;
-	}
-
-        start_pos = sp->current_in;
-	while (1) {
+	list_for_each_circular(sp->current_in, &sp->connections, start_pos) {
 
 		usock = container_of (sp->current_in, struct sp_usock, list);
 
@@ -583,15 +538,8 @@ loop:
 		/*  Forward the error up the stack */
 		if (rc != -EAGAIN)
 			goto out_unlock;
-
-		sp->current_in = sp->current_in->next;
-		if (sp->current_in == &sp->connections)
-			sp->current_in = sp->current_in->next;
-		if (sp->current_in == start_pos)
-			break;
 	}
 
-wait:
 	/* There are no message and we are in the non-blocking mode */
 	if (flags & MSG_DONTWAIT) {
 		rc = -EAGAIN;
@@ -637,8 +585,6 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 	}
 	addr_sp = (struct sockaddr_sp *)addr;
 
-	printk(KERN_INFO "SP: Binding to %s", addr_sp->ssp_endpoint);
-
 	/* Convert the textual address into a structure */
 	rc = sp_parse_address (addr_sp->ssp_endpoint, &protocol,
 		&uaddr, &uaddr_len);
@@ -659,8 +605,6 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 			goto out_dealloc;
 
 		/* Register the TCP listener socket with the SP socket */
-		printk(KERN_INFO "SP: %s registering listener sk=%p\n",
-			__func__, usock->s->sk);
 		sp_register_usock (sp, usock, SP_USOCK_LISTENER,
 			sp_listener_work_in, NULL, NULL, 1);
 
@@ -715,8 +659,6 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 	}
 	addr_sp = (struct sockaddr_sp *)addr;
 
-	printk(KERN_INFO "SP: Connecting to %s\n", addr_sp->ssp_endpoint);
-
 	/* Convert the textual address into a structure */
 	rc = sp_parse_address (addr_sp->ssp_endpoint, &protocol,
 		&uaddr, &uaddr_len);
@@ -737,8 +679,6 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 			goto out_dealloc;
 
 		/* Register the TCP socket with the SP socket */
-		printk(KERN_INFO "SP: %s: registering connected peer sk=%p\n",
-			__func__, usock->s->sk);
 		sp_register_usock (sp, usock, SP_USOCK_CONNECTION,
 			sp_data_work_in, sp_data_work_out,
 			sp_data_work_destroy, 0);
@@ -785,7 +725,6 @@ static int sp_release(struct socket *sock)
 	/* First, destroy all the underlying listeners */
 	list_for_each_entry_safe(it, next, &sp->listeners, list) {
 		sp_usock_destroy (it, 1);
-		printk(KERN_INFO "SP: Underlying listener deallocated\n");
 	}
 
 	/* First, destroy all the underlying connections */
@@ -798,8 +737,6 @@ static int sp_release(struct socket *sock)
 	sock_orphan(sk);
 	sock_put(sk);
 
-	printk(KERN_INFO "SP: %s destroyed SP socket sk=%p\n", __func__,
-		sock->sk);
 	sock->sk = NULL;
 
 	return 0;
@@ -849,15 +786,13 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	mutex_init(&sp->sync);
 	sp->recv_waiting = 0;
 	sp->send_waiting = 0;
-	sp->current_in = NULL;
-	sp->current_out = NULL;
+	sp->current_in = &sp->connections;
+	sp->current_out = &sp->connections;
 
 	/* Increment procotol family refcount */
 	local_bh_disable();
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
 	local_bh_enable();
-
-	printk(KERN_INFO "SP: %s created SP socket sk=%p\n", __func__, sp);
 
 	return 0;
 }
