@@ -275,7 +275,7 @@ static void sp_data_work_destroy(struct work_struct *work)
 static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	struct list_head *list, void (*infunc)(struct work_struct*),
 	void (*outfunc)(struct work_struct*),
-	void (*destroyfunc)(struct work_struct*))
+	void (*statefunc)(struct work_struct*), int active)
 {
 	/* Basic initialisation */
 	sp_decoder_init(&usock->decoder, sp_usock_read);
@@ -284,10 +284,11 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	/* Initialize work items for this socket */
 	INIT_WORK(&usock->work_in, infunc);
 	INIT_WORK(&usock->work_out, outfunc);
-	INIT_WORK(&usock->work_destroy, destroyfunc);
+	INIT_WORK(&usock->work_destroy, statefunc);
 
 	/* Install callbacks for work items */
 	write_lock_bh(&usock->s->sk->sk_callback_lock);
+	usock->active = active;
 	usock->s->sk->sk_user_data = (void *)usock;
 	usock->old_sk_state_change = usock->s->sk->sk_state_change;
 	usock->old_sk_data_ready = usock->s->sk->sk_data_ready;
@@ -296,7 +297,7 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 		usock->s->sk->sk_data_ready = sp_in_cb;
 	if (outfunc)
 		usock->s->sk->sk_write_space = sp_out_cb;
-	if (destroyfunc)
+	if (statefunc)
 		usock->s->sk->sk_state_change = sp_state_cb;
 	write_unlock_bh(&usock->s->sk->sk_callback_lock);
 
@@ -344,7 +345,7 @@ static void sp_listener_work_in(struct work_struct *work)
 		sp_register_usock (listener->owner, new_usock,
 			&listener->owner->connections,
 			sp_data_work_in, sp_data_work_out,
-			sp_data_work_destroy);
+			sp_data_work_destroy, 1);
 	}
 }
 
@@ -394,10 +395,15 @@ static void sp_state_cb(struct sock *sk)
 	printk(KERN_INFO "SP: state_cb owner=%p sk=%p sk_state=%d\n",
 		usock->owner, sk, sk->sk_state);
 
+	write_lock_bh(sk->sk_callback_lock);
+	/* kernel_connect() has completed on this socket */
+	if (sk->sk_state == TCP_ESTABLISHED)
+		usock->active = 1;
 	/* Remote peer has closed the connection, schedule work item to
 	   deregister the underlying socket */
-	if (sk->sk_state == TCP_CLOSE_WAIT)
+	else if (sk->sk_state == TCP_CLOSE_WAIT)
 		schedule_work(&usock->work_destroy);
+	write_unlock_bh(sk->sk_callback_lock);
 }
 
 /*
@@ -414,6 +420,14 @@ static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 
 loop:
 	list_for_each_entry(usock, &sp->connections, list) {
+
+		/* Skip inactive peers */
+		read_lock_bh(&usock->s->sk->sk_callback_lock);
+		if (!usock->active) {
+			read_unlock_bh(&usock->s->sk->sk_callback_lock);
+			continue;
+		}
+		read_unlock_bh(&usock->s->sk->sk_callback_lock);
 
 		/* Try to put the message to the specific underlying socket */
 		rc = sp_encoder_put_message(&usock->encoder, msg, len);
@@ -469,6 +483,14 @@ static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 loop:
 	/* Loop over all the underlying sockets */
 	list_for_each_entry(usock, &sp->connections, list) {
+
+		/* Skip inactive peers */
+		read_lock_bh(&usock->s->sk->sk_callback_lock);
+		if (!usock->active) {
+			read_unlock_bh(&usock->s->sk->sk_callback_lock);
+			continue;
+		}
+		read_unlock_bh(&usock->s->sk->sk_callback_lock);
 
 		/*  Try to get a message from this underlying socket */
 		rc = sp_decoder_get_message(&usock->decoder, size,
@@ -558,7 +580,7 @@ static int sp_bind(struct socket *sock, struct sockaddr *addr,
 		printk(KERN_INFO "SP: %s registering listener sk=%p\n",
 			__func__, usock->s->sk);
 		sp_register_usock (sp, usock, &sp->listeners,
-			sp_listener_work_in, NULL, NULL);
+			sp_listener_work_in, NULL, NULL, 1);
 
 		/* Bind and listen for connections on listener socket */
 		rc = kernel_bind(usock->s, (struct sockaddr *)&uaddr,
@@ -637,13 +659,15 @@ static int sp_connect(struct socket *sock, struct sockaddr *addr,
 			__func__, usock->s->sk);
 		sp_register_usock (sp, usock, &sp->connections,
 			sp_data_work_in, sp_data_work_out,
-			sp_data_work_destroy);
+			sp_data_work_destroy, 0);
 
 		/* Start connecting to the peer */
 		rc = kernel_connect(usock->s, (struct sockaddr *)&uaddr,
 			uaddr_len, O_NONBLOCK);
 		if (rc < 0 && rc != -EINPROGRESS)
 			goto out_release;
+		/* Success will be reported by sp_state_cb setting usock->active
+		   to 1; TODO handle failures/reconnect */
 	}
 	else {
 		/* This should not happen. If parsing was successfull */

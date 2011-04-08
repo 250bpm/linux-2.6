@@ -38,6 +38,8 @@ struct sp_usock {
 	void (*old_sk_state_change)(struct sock *);
 	void (*old_sk_data_ready)(struct sock *, int);
 	void (*old_sk_write_space)(struct sock *);
+	/* True if this socket is active */
+	int active;
 };
 
 /* The AF_SP socket private data */
