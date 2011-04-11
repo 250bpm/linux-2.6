@@ -1,7 +1,7 @@
 /*
  * SP: An implementation of SP sockets.
  *
- * Copyright 2010 VMware, Inc.
+ * Copyright 2011 VMware, Inc.
  *
  * Authors: Martin Sustrik <sustrik@250bpm.com>
  *	    Martin Lucina <mato@kotelna.sk>

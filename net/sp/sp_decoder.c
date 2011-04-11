@@ -1,3 +1,8 @@
+/*
+ * SP: An implementation of SP sockets.
+ *
+ * Copyright 2011 VMware, Inc.
+ */
 
 #include <linux/kernel.h>
 #include <linux/err.h>
