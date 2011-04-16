@@ -30,7 +30,21 @@ static int sp_release(struct socket *sock);
 static int sp_connect(struct socket *, struct sockaddr *, int, int);
 static int sp_bind(struct socket *, struct sockaddr *, int);
 static int sp_sendmsg(struct kiocb *, struct socket *, struct msghdr *, size_t);
+static int lb_sendmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
+	size_t);
+static int dist_sendmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
+	size_t);
+static int req_sendmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
+	size_t);
+static int rep_sendmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
+	size_t);
 static int sp_recvmsg(struct kiocb *, struct socket *, struct msghdr *,
+	size_t, int);
+static int fq_recvmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
+	size_t, int);
+static int req_recvmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
+	size_t, int);
+static int rep_recvmsg(struct kiocb *, struct sp_sock *, struct msghdr *,
 	size_t, int);
 static void sp_in_cb(struct sock *sk, int bytes);
 static void sp_out_cb(struct sock *sk);
@@ -71,7 +85,7 @@ static const struct net_proto_family sp_family_ops = {
 	.owner =	THIS_MODULE,
 };
 
-/* SP SOCK_PUB socket operations */
+/* SP socket operations */
 static const struct proto_ops sp_sock_ops = {
 	.family =	PF_SP,
 	.owner =	THIS_MODULE,
@@ -164,10 +178,14 @@ static void sp_usock_destroy (struct sp_usock *usock, int sync)
 	list_del(&usock->list);
 
 	/* If current pipe is being deleted reset current to 1st item */
-	if (owner->current_in == &usock->list)
+	if (owner->current_in == &usock->list) {
 		owner->current_in = owner->connections.next;
-	if (owner->current_out == &usock->list)
+		owner->current_disconnected = 1;
+	}
+	if (owner->current_out == &usock->list) {
 		owner->current_out = owner->connections.next;
+		owner->current_disconnected = 1;
+	}
 
 	sp_decoder_destroy(&usock->decoder);
 	sp_encoder_destroy(&usock->encoder);
@@ -340,6 +358,7 @@ static void sp_register_usock (struct sp_sock *owner, struct sp_usock *usock,
 	else {
 		BUG();
 	}
+
 	/*  If there's user thread waiting to send, unblock it */
 	if(active && owner->send_waiting) {
 		owner->send_waiting = 0;
@@ -432,14 +451,25 @@ static void sp_state_cb(struct sock *sk)
 }
 
 /*
- * sp_sendmsg: Send a message to a socket
+ * sp_sendmsg: Forwards sendmsg call to socket-type-specific algorithm
  */
 static int sp_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	struct msghdr *msg, size_t len)
 {
+	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
+        if (!sp->sendmsg)
+		return -ENOTSUPP;
+	return (sp->sendmsg)(kiocb, sp, msg, len);
+}
+
+/*
+ * lb_sendmsg: Load-balancing send
+ */
+static int lb_sendmsg(struct kiocb *kiocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t len)
+{
 	struct sp_usock *usock;
 	int rc = 0;
-	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
 	struct list_head *start_pos;
 
 	mutex_lock(&sp->sync);
@@ -495,12 +525,119 @@ out_unlock:
 }
 
 /*
- * sp_recvmsg: Receive a message from a socket
+ * req_sendmsg: Load-balancing send with a state machine
+ */
+static int req_sendmsg(struct kiocb *kiocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t len)
+{
+	int rc;
+
+	/* TODO: Choose a more appropriate error code */
+	if (sp->state == SP_SOCK_REQ_STATE_BUSY)
+		return -EINVAL;
+
+	rc = lb_sendmsg (kiocb, sp, msg, len);
+	if (rc < 0)
+		return rc;
+
+	sp->state = SP_SOCK_REQ_STATE_BUSY;
+	sp->current_disconnected = 0;
+	return rc;
+}
+
+/*
+ * dist_sendmsg: Distributes sent message to all the connected peers
+ */
+static int dist_sendmsg(struct kiocb *kiocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t len)
+{
+	struct sp_usock *usock;
+	int rc = 0;
+
+	mutex_lock(&sp->sync);
+
+	list_for_each_entry(usock, &sp->connections, list) {
+
+		/* Skip inactive peers */
+		read_lock_bh(&usock->s->sk->sk_callback_lock);
+		if (!usock->active) {
+			read_unlock_bh(&usock->s->sk->sk_callback_lock);
+			continue;
+		}
+		read_unlock_bh(&usock->s->sk->sk_callback_lock);
+
+		/* Try to put the message to the specific underlying socket */
+		rc = sp_encoder_put_message(&usock->encoder, msg, len);
+
+		/* Forward the error to the caller */
+		if (rc < 0 && rc != -EAGAIN)
+			goto out_unlock;
+	}
+
+        /* In case of success return size of the message */
+        rc = len;
+
+out_unlock:
+	mutex_unlock(&sp->sync);
+	return rc;
+}
+
+/*
+ * rep_sendmsg: Routes replies back to the requester
+ */
+static int rep_sendmsg(struct kiocb *kiocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t len)
+{
+	struct sp_usock *usock;
+	int rc = 0;
+
+	mutex_lock(&sp->sync);
+
+	/* If the requester have disconnected during the processing of
+	   the request, silently drop the reply */
+	if (sp->current_disconnected) {
+		rc = len;
+		goto out_unlock;
+	}
+
+	usock = container_of (sp->current_in, struct sp_usock, list);
+
+	/* Try to put the message to the specific underlying socket */
+	rc = sp_encoder_put_message(&usock->encoder, msg, len);
+
+	/* Forward the error to the caller */
+	if (rc < 0 && rc != -EAGAIN)
+		goto out_unlock;
+
+        /* In case of success return size of the message */
+        rc = len;
+
+	sp->state = SP_SOCK_REP_STATE_IDLE;
+	sp->current_disconnected = 0;
+
+out_unlock:
+	mutex_unlock(&sp->sync);
+	return rc;
+}
+
+/*
+ * sp_recvmsg: Forwards recvmsg call to socket-type-specific algorithm
  */
 static int sp_recvmsg(struct kiocb *iocb, struct socket *sock,
 	struct msghdr *msg, size_t size, int flags)
 {
 	struct sp_sock *sp = container_of (sock->sk, struct sp_sock, sk);
+        if (!sp->recvmsg)
+		return -ENOTSUPP;
+	return (sp->recvmsg)(iocb, sp, msg, size, flags);
+}
+
+/*
+ * fq_recvmsg: Receive a message from a socket using fair-queueing algorithm
+ */
+static int fq_recvmsg(struct kiocb *iocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t size, int flags)
+{
 	struct sp_usock *usock;
 	int rc;
 	void *msg_data;
@@ -560,6 +697,51 @@ loop:
 
 out_unlock:
 	mutex_unlock(&sp->sync);
+	return rc;
+}
+
+/*
+ * req_recvmsg: Receive a message from a socket using fair-queueing algorithm,
+ *              also use a REQ-style state machine.
+ */
+static int req_recvmsg(struct kiocb *iocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t size, int flags)
+{
+	int rc;
+
+	/* TODO: Choose a more appropriate error code */
+	if (sp->state == SP_SOCK_REQ_STATE_IDLE)
+		return -EINVAL;
+	if (sp->current_disconnected)
+		return -EINVAL;
+
+	rc = fq_recvmsg (iocb, sp, msg, size, flags);
+	if (rc < 0)
+		return rc;
+
+	sp->state = SP_SOCK_REQ_STATE_IDLE;
+	return rc;
+}
+
+/*
+ * rep_recvmsg: Receive a message from a socket using fair-queueing algorithm,
+ *              also use a REP-style state machine.
+ */
+static int rep_recvmsg(struct kiocb *iocb, struct sp_sock *sp,
+	struct msghdr *msg, size_t size, int flags)
+{
+	int rc;
+
+	/* TODO: Choose a more appropriate error code */
+	if (sp->state == SP_SOCK_REP_STATE_BUSY)
+		return -EINVAL;
+
+	rc = fq_recvmsg (iocb, sp, msg, size, flags);
+	if (rc < 0)
+		return rc;
+
+	sp->state = SP_SOCK_REP_STATE_BUSY;
+	sp->current_disconnected = 0;
 	return rc;
 }
 
@@ -775,12 +957,45 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	if (!sk)
 		return -ENOMEM;
 
+        /* Initialise socket-type-specific functions */
+	sp = (struct sp_sock *)sk;
+	switch (sock->type) {
+	case SOCK_PUB:
+	        sp->sendmsg = dist_sendmsg;
+	        sp->recvmsg = NULL;
+		break;
+	case SOCK_SUB:
+	        sp->sendmsg = NULL;
+	        sp->recvmsg = fq_recvmsg;
+		break;
+	case SOCK_REQ:
+	        sp->sendmsg = req_sendmsg;
+	        sp->recvmsg = req_recvmsg;
+		sp->state = SP_SOCK_REQ_STATE_IDLE;
+		break;
+	case SOCK_REP:
+	        sp->sendmsg = rep_sendmsg;
+	        sp->recvmsg = rep_recvmsg;
+		sp->state = SP_SOCK_REP_STATE_IDLE;
+		break;
+	case SOCK_PUSH:
+	        sp->sendmsg = lb_sendmsg;
+	        sp->recvmsg = NULL;
+		break;
+	case SOCK_PULL:
+	        sp->sendmsg = NULL;
+	        sp->recvmsg = fq_recvmsg;
+		break;
+	default:
+		kfree (sk);
+		return -ESOCKTNOSUPPORT;
+	}
+
 	/* Initialise the underlying socket */
 	sock_init_data(sock, sk);
 	sk->sk_destruct	= sp_destruct;
 
 	/* Initialise the SP socket itself */
-	sp = (struct sp_sock *)sk;
 	INIT_LIST_HEAD(&sp->listeners);
 	INIT_LIST_HEAD(&sp->connections);
 	mutex_init(&sp->sync);
@@ -788,6 +1003,7 @@ static int sp_create(struct net *net, struct socket *sock, int protocol,
 	sp->send_waiting = 0;
 	sp->current_in = &sp->connections;
 	sp->current_out = &sp->connections;
+	sp->current_disconnected = 0;
 
 	/* Increment procotol family refcount */
 	local_bh_disable();

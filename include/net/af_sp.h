@@ -18,6 +18,12 @@
 
 #ifdef __KERNEL__
 
+#define SP_SOCK_REQ_STATE_IDLE 0
+#define SP_SOCK_REQ_STATE_BUSY 1
+
+#define SP_SOCK_REP_STATE_IDLE 0
+#define SP_SOCK_REP_STATE_BUSY 1
+
 /* A single underlying socket */
 struct sp_usock {
 	/* Each SP socket has a list of usocks */
@@ -62,6 +68,16 @@ struct sp_sock {
 	/* Pointers to current in/out usock */
 	struct list_head *current_in;
 	struct list_head *current_out;
+        /* If 1, the currently processed connection have disconnected */
+        int current_disconnected;
+	/* Virtual send and recv functions */
+	int (*sendmsg)(struct kiocb *, struct sp_sock *, struct msghdr *,
+		size_t);
+	int (*recvmsg)(struct kiocb *, struct sp_sock *, struct msghdr *,
+		size_t, int);
+	/* State of the FSM associated with the SP socket. Actual states
+           depend on the socket type. */
+	int state;
 };
 
 #endif

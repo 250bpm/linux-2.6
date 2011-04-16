@@ -66,7 +66,7 @@ int sp_encoder_put_message(struct sp_encoder *ecdr, struct msghdr *msg, int len)
 	}
 
 	/* Copy the message to the buffer */
-	rc = memcpy_fromiovec(ecdr->msg_data, msg->msg_iov, len);
+	rc = memcpy_fromiovec_nomodify(ecdr->msg_data, msg->msg_iov, len);
 	if (rc < 0) 
 		goto out_dealloc;
 	ecdr->msg_size = len;

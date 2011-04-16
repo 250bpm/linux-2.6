@@ -98,12 +98,16 @@ enum sock_type {
 	SOCK_PACKET	= 10,
         SOCK_PUB        = 11,
         SOCK_SUB        = 12,
+        SOCK_REQ        = 13,
+        SOCK_REP        = 14,
+        SOCK_PUSH       = 15,
+        SOCK_PULL       = 16
 };
 
-#define SOCK_MAX (SOCK_SUB + 1)
+#define SOCK_MAX (SOCK_PULL + 1)
 /* Mask which covers at least up to SOCK_MASK-1.  The
  * remaining bits are used as flags. */
-#define SOCK_TYPE_MASK 0xf
+#define SOCK_TYPE_MASK 0x1f
 
 /* Flags for socket, socketpair, accept4 */
 #define SOCK_CLOEXEC	O_CLOEXEC
